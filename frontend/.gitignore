@@ -1,0 +1,49 @@
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Generated audio and media
+*.mp3
+*.wav
+*.mp4
+*.webm
+*.m4a
+
+# Frontend dependencies
+node_modules/
+frontend/node_modules/
+
+# Build outputs
+dist/
+build/
+coverage/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
