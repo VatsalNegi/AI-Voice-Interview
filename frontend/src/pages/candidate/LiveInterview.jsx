@@ -140,8 +140,18 @@ export default function LiveInterview() {
 
     async function initializeMedia() {
       try {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error(
+            "Camera access is unavailable. Open this page using localhost or HTTPS in a supported browser."
+          );
+        }
+
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
+          video: {
+            facingMode: "user",
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
           audio: true,
         });
 
@@ -152,20 +162,23 @@ export default function LiveInterview() {
 
         streamRef.current = stream;
 
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-        }
+        const videoTrack = stream.getVideoTracks()[0];
+        const audioTrack = stream.getAudioTracks()[0];
 
-        setCameraEnabled(true);
-        setMicEnabled(true);
-        micEnabledRef.current = true;
-
+        setCameraEnabled(Boolean(videoTrack?.enabled));
+        setMicEnabled(Boolean(audioTrack?.enabled));
+        micEnabledRef.current = Boolean(audioTrack?.enabled);
       } catch (err) {
         console.error("Media permission error:", err);
 
-        setPermissionError(
-          "Camera or microphone access was denied. Please allow access in your browser settings."
-        );
+        if (active) {
+          setPermissionError(
+            err.name === "NotAllowedError"
+              ? "Camera or microphone permission was denied. Allow access in your browser settings and reload the interview."
+              : err.message ||
+                "Unable to access your camera or microphone. Check that your devices are connected and not being used by another application."
+          );
+        }
       }
     }
 
@@ -179,8 +192,40 @@ export default function LiveInterview() {
         streamRef.current = null;
       }
     };
-
   }, []);
+
+  // Attach the stream after the interview UI (and video element) has mounted.
+  // The loading screen initially prevents the video element from existing.
+  useEffect(() => {
+    const video = videoRef.current;
+    const stream = streamRef.current;
+
+    if (!video || !stream) return;
+
+    video.srcObject = stream;
+
+    const playVideo = async () => {
+      try {
+        await video.play();
+        console.log("Camera preview started successfully.");
+      } catch (err) {
+        console.error("Camera preview playback failed:", err);
+        setPermissionError(
+          "The camera is connected, but the preview could not start. Try refreshing the page or checking browser camera permissions."
+        );
+      }
+    };
+
+    if (video.readyState >= 1) {
+      playVideo();
+    } else {
+      video.onloadedmetadata = playVideo;
+    }
+
+    return () => {
+      video.onloadedmetadata = null;
+    };
+  }, [loading, cameraEnabled]);
 
 
   // =========================================
@@ -1153,9 +1198,6 @@ export default function LiveInterview() {
                 Candidate Camera
               </h3>
 
-              <span className="text-xs text-red-400">
-                ● RECORDING NOT ENABLED
-              </span>
 
             </div>
 
@@ -1170,7 +1212,7 @@ export default function LiveInterview() {
                 muted
                 playsInline
                 className={`w-full h-full object-cover ${
-                  cameraEnabled ? "" : "hidden"
+                  cameraEnabled ? "block" : "hidden"
                 }`}
               />
 

@@ -5,6 +5,7 @@ from typing import Literal
 
 class AIEvaluation(BaseModel):
 
+    # Evaluation scores
     technical_correctness: int | None = Field(
         default=None, ge=0, le=100
     )
@@ -21,16 +22,47 @@ class AIEvaluation(BaseModel):
         default=None, ge=0, le=100
     )
 
-    matched_concepts: list[str] = Field(default_factory=list)
-    missing_concepts: list[str] = Field(default_factory=list)
-    incorrect_statements: list[str] = Field(default_factory=list)
+    # Answer classification
+    answer_classification: Literal[
+        "GOOD",
+        "PARTIAL",
+        "IRRELEVANT",
+        "NO_KNOWLEDGE"
+    ] = "PARTIAL"
 
-    evidence: list[str] = Field(default_factory=list)
-    strengths: list[str] = Field(default_factory=list)
-    improvement_areas: list[str] = Field(default_factory=list)
+    # Concept evaluation
+    matched_concepts: list[str] = Field(
+        default_factory=list
+    )
+
+    missing_concepts: list[str] = Field(
+        default_factory=list
+    )
+
+    # Incorrect claims and supporting evidence
+    incorrect_statements: list[str] = Field(
+        default_factory=list
+    )
+
+    evidence: list[str] = Field(
+        default_factory=list
+    )
+
+    # Qualitative feedback
+    strengths: list[str] = Field(
+        default_factory=list
+    )
+
+    improvement_areas: list[str] = Field(
+        default_factory=list
+    )
 
     overall_feedback: str = (
         "AI evaluation was incomplete. Manual review is recommended."
     )
 
-    confidence: Literal["low", "medium", "high"] = "low"
+    confidence: Literal[
+        "low",
+        "medium",
+        "high"
+    ] = "low"

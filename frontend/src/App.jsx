@@ -1,48 +1,71 @@
 
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 
-// Pages
+// Candidate pages
 import Home from "./Home";
 import CandidateRegistration from "./pages/candidate/CandidateRegistration";
 import CandidateInstructions from "./pages/candidate/CandidateInstructions";
 import LiveInterview from "./pages/candidate/LiveInterview";
 
+// Recruiter pages
+import RecruiterLogin from "./pages/Recruiter/RecruiterLogin";
+import RecruiterDashboard from "./pages/Recruiter/RecruiterDashboard";
+import InterviewDetails from "./pages/Recruiter/InterviewDetails";
+
+// Authentication
+import { AuthProvider } from "./context/AuthContext";
+import ProtectedRoute from "./components/recruiter/ProtectedRoute";
+
 export default function App() {
   return (
     <BrowserRouter>
-      <Routes>
+      <AuthProvider>
+        <Routes>
+          {/* Home */}
+          <Route path="/" element={<Home />} />
 
-        {/* Home Page */}
-        <Route
-          path="/"
-          element={<Home />}
-        />
+          {/* Candidate Routes */}
+          <Route
+            path="/candidate/register"
+            element={<CandidateRegistration />}
+          />
 
-        {/* Candidate Registration */}
-        <Route
-          path="/candidate/register"
-          element={<CandidateRegistration />}
-        />
+          <Route
+            path="/candidate/instructions"
+            element={<CandidateInstructions />}
+          />
 
-        {/* Candidate Interview Instructions */}
-        <Route
-          path="/candidate/instructions"
-          element={<CandidateInstructions />}
-        />
+          <Route
+            path="/candidate/interview"
+            element={<LiveInterview />}
+          />
 
-        {/* Live Interview */}
-        <Route
-          path="/candidate/interview"
-          element={<LiveInterview />}
-        />
+          {/* Recruiter Login */}
+          <Route
+            path="/recruiter/login"
+            element={<RecruiterLogin />}
+          />
 
-        {/* Unknown routes */}
-        <Route
-          path="*"
-          element={<Navigate to="/" replace />}
-        />
+          {/* Protected Recruiter Routes */}
+          <Route element={<ProtectedRoute />}>
+            <Route
+              path="/recruiter/dashboard"
+              element={<RecruiterDashboard />}
+            />
 
-      </Routes>
+            <Route
+              path="/recruiter/interviews/:sessionId"
+              element={<InterviewDetails />}
+            />
+          </Route>
+
+          {/* Fallback */}
+          <Route
+            path="*"
+            element={<Navigate to="/" replace />}
+          />
+        </Routes>
+      </AuthProvider>
     </BrowserRouter>
   );
 }

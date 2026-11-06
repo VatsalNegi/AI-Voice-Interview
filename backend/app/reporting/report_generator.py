@@ -13,7 +13,12 @@ from app.reporting.scoring_engine import ScoringEngine
 class ReportGenerator:
 
     @staticmethod
-    def _get_question_details(question_id):
+    def _get_question_details(question_id, session=None):
+        if session:
+            questions_metadata = session.get("questions_metadata", {})
+            if question_id in questions_metadata:
+                return questions_metadata[question_id]
+
         for questions in QUESTION_BANK.values():
             for question in questions:
                 if question["question_id"] == question_id:
@@ -159,7 +164,8 @@ class ReportGenerator:
         for question_id, evaluation in scores.items():
 
             question = ReportGenerator._get_question_details(
-                question_id
+                question_id,
+                session
             )
 
             if question is None:

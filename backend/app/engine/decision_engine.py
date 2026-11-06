@@ -1,55 +1,147 @@
 
 class DecisionEngine:
+    """
+    Determines the next interview action using answer classification.
+
+    Supported classifications:
+        GOOD
+        PARTIAL
+        IRRELEVANT
+        NO_KNOWLEDGE
+
+    Maximum one follow-up per primary question.
+    """
+
+    MAX_FOLLOWUPS = 1
 
     @staticmethod
     def decide_next_action(
-        question,
-        evaluation,
-        followup_count=0,
-        explored_concepts=None
-    ):
-
-        max_followups = question.get("max_followups", 2)
-
-        missing_concepts = evaluation.get(
-            "missing_concepts", []
-        )
+        question: dict,
+        evaluation: dict,
+        followup_count: int = 0,
+        explored_concepts: list | None = None
+    ) -> dict:
 
         explored_concepts = explored_concepts or []
 
-        # All expected concepts have been covered
-        if not missing_concepts:
+        classification = str(
+            evaluation.get("answer_classification", "")
+        ).upper().strip()
+
+        # --------------------------------------------------
+        # CASE 1: CANDIDATE DOES NOT KNOW THE ANSWER
+        # --------------------------------------------------
+
+        if classification == "NO_KNOWLEDGE":
+
             return {
                 "action": "NEXT_QUESTION",
-                "reason": "All expected concepts have been covered.",
-                "target_concepts": []
+                "reason": (
+                    "Candidate explicitly indicated that "
+                    "they do not know the answer."
+                ),
+                "target_concepts": [],
+                "answer_classification": classification
             }
 
-        # Maximum follow-ups have already been asked
-        if followup_count >= max_followups:
+        # --------------------------------------------------
+        # CASE 2: IRRELEVANT ANSWER
+        # --------------------------------------------------
+
+        if classification == "IRRELEVANT":
+
             return {
                 "action": "NEXT_QUESTION",
-                "reason": "Maximum follow-up limit reached.",
-                "target_concepts": []
+                "reason": (
+                    "Candidate's answer was not relevant "
+                    "to the question."
+                ),
+                "target_concepts": [],
+                "answer_classification": classification
             }
 
-        # Avoid repeating concepts already explored
-        unexplored_concepts = [
-            concept
-            for concept in missing_concepts
-            if concept not in explored_concepts
-        ]
+        # --------------------------------------------------
+        # CASE 3: GOOD ANSWER
+        # --------------------------------------------------
 
-        if not unexplored_concepts:
+        if classification == "GOOD":
+
             return {
                 "action": "NEXT_QUESTION",
-                "reason": "All missing concepts have already been explored.",
-                "target_concepts": []
+                "reason": (
+                    "Candidate provided a satisfactory answer."
+                ),
+                "target_concepts": [],
+                "answer_classification": classification
             }
 
-        # Ask a follow-up about remaining missing concepts
+        # --------------------------------------------------
+        # CASE 4: PARTIALLY CORRECT ANSWER
+        # --------------------------------------------------
+
+        if classification == "PARTIAL":
+
+            # Never ask more than one follow-up.
+            if followup_count >= DecisionEngine.MAX_FOLLOWUPS:
+
+                return {
+                    "action": "NEXT_QUESTION",
+                    "reason": (
+                        "Maximum follow-up limit reached."
+                    ),
+                    "target_concepts": [],
+                    "answer_classification": classification
+                }
+
+            missing_concepts = evaluation.get(
+                "missing_concepts", []
+            )
+
+            # Find concepts that have not already
+            # been explored in previous follow-ups.
+            unexplored_concepts = [
+                concept
+                for concept in missing_concepts
+                if concept not in explored_concepts
+            ]
+
+            if not unexplored_concepts:
+
+                return {
+                    "action": "NEXT_QUESTION",
+                    "reason": (
+                        "No unexplored concepts remain "
+                        "for clarification."
+                    ),
+                    "target_concepts": [],
+                    "answer_classification": classification
+                }
+
+            return {
+                "action": "FOLLOW_UP",
+                "reason": (
+                    "Candidate demonstrated partial "
+                    "understanding. One clarification "
+                    "is appropriate."
+                ),
+                "target_concepts": unexplored_concepts[:2],
+                "answer_classification": classification
+            }
+
+        # --------------------------------------------------
+        # CASE 5: UNKNOWN OR MISSING CLASSIFICATION
+        # --------------------------------------------------
+
+        # Fail safely. Do not return to the old behavior
+        # of generating follow-ups from missing concepts.
         return {
-            "action": "FOLLOW_UP",
-            "reason": "Some expected concepts need further exploration.",
-            "target_concepts": unexplored_concepts[:2]
+            "action": "NEXT_QUESTION",
+            "reason": (
+                "Answer classification is unavailable. "
+                "Moving to the next question safely."
+            ),
+            "target_concepts": [],
+            "answer_classification": (
+                classification or "UNCLASSIFIED"
+            )
         }

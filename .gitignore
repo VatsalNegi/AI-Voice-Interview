@@ -1,38 +1,40 @@
-# Environment variables and secrets
+# Environment variables
 .env
 .env.*
 !.env.example
-**/.env
-**/.env.*
-!**/.env.example
 
-# Python
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.venv/
-venv/
+.mypy_cache/
 
-# Node
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Node dependencies
 node_modules/
 
-# Build files
+# Production build
 dist/
-build/
-coverage/
 
-# Generated media
-*.mp3
-*.wav
-*.mp4
-*.webm
-*.m4a
-
-# IDE and OS
+# IDE
 .vscode/
 .idea/
-.DS_Store
-Thumbs.db
 
 # Logs
 *.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local voice testing audio
+backend/custom_voice_test.mp3
