@@ -1,5 +1,7 @@
+
 from app.routers.recruiter_dashboard import router as recruiter_dashboard_router
 from contextlib import asynccontextmanager
+import os
 
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.responses import Response
@@ -64,12 +66,23 @@ app.include_router(recruiter_dashboard_router)
 # CORS
 # --------------------------------------------------
 
+# Keep local development origins and add deployed frontend origin(s)
+# through FRONTEND_URL. Multiple origins can be comma-separated.
+frontend_origins = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv("FRONTEND_URL", "").split(",")
+    if origin.strip()
+]
+
+allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    *frontend_origins,
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
