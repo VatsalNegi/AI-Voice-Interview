@@ -1,11 +1,11 @@
-
 from app.routers.recruiter_dashboard import router as recruiter_dashboard_router
 from contextlib import asynccontextmanager
 import os
 
-from fastapi import FastAPI, HTTPException, Depends, status
-from fastapi.responses import Response
+from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks
+from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -34,7 +34,13 @@ from app.schemas.interview import (
 
 from app.services.tts_service import TTSService
 from app.services.session_manager import SessionManager
-from app.reporting.report_generator import ReportGenerator
+from app.services.post_interview_evaluator import PostInterviewEvaluator
+
+
+class InterviewTerminationRequest(BaseModel):
+    reason: str
+    violation_count: int | None = Field(default=None, ge=0)
+    proctoring_event: dict | None = None
 
 
 # --------------------------------------------------
@@ -54,13 +60,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-
     title="AI Voice Interview Engine",
     description="An intelligent, adaptive AI-powered voice interview system.",
     version="1.0.0",
     lifespan=lifespan,
 )
 app.include_router(recruiter_dashboard_router)
+
 
 # --------------------------------------------------
 # CORS
@@ -273,6 +279,7 @@ def start_interview(session_id: str):
 async def submit_candidate_answer(
     session_id: str,
     answer_data: CandidateAnswerSubmit,
+    background_tasks: BackgroundTasks,
 ):
     session = SessionManager.get_session(session_id)
 
@@ -288,6 +295,14 @@ async def submit_candidate_answer(
             answer_text=answer_data.answer_text,
         )
 
+        # The live interview has finished. Run the AI evaluation after
+        # the response is prepared, so the candidate does not wait for it.
+        if result.get("status") == "completed":
+            background_tasks.add_task(
+                PostInterviewEvaluator.run,
+                session_id,
+            )
+
         return {
             "message": "Answer submitted successfully",
             "result": result,
@@ -301,12 +316,15 @@ async def submit_candidate_answer(
 
 
 # --------------------------------------------------
-# INTERVIEW REPORT
-# Kept unchanged for now.
+# TERMINATE INTERVIEW
+# Terminated interviews retain answers/transcript but skip AI evaluation.
 # --------------------------------------------------
 
-@app.get("/interviews/{session_id}/report")
-def generate_interview_report(session_id: str):
+@app.post("/interviews/{session_id}/terminate")
+def terminate_interview(
+    session_id: str,
+    termination_data: InterviewTerminationRequest,
+):
     session = SessionManager.get_session(session_id)
 
     if session is None:
@@ -315,39 +333,104 @@ def generate_interview_report(session_id: str):
             detail="Interview session not found",
         )
 
-    if session["status"] != "completed":
-        raise HTTPException(
-            status_code=409,
-            detail="Interview must be completed before generating the report.",
-        )
-
-    if session.get("final_report"):
-        return {
-            "message": "Interview report generated successfully",
-            "report": session["final_report"],
-        }
-
     try:
-        report = ReportGenerator.generate_report(session)
-
-        SessionManager.update_session(
-            session_id,
-            {
-                "final_report": report.model_dump(),
-                "overall_score": report.overall_score,
-            },
+        terminated_session = SessionManager.terminate_interview(
+            session_id=session_id,
+            reason=termination_data.reason,
+            violation_count=termination_data.violation_count,
+            proctoring_event=termination_data.proctoring_event,
         )
-
-        return {
-            "message": "Interview report generated successfully",
-            "report": report.model_dump(),
-        }
-
     except ValueError as error:
         raise HTTPException(
             status_code=409,
             detail=str(error),
         )
+
+    if terminated_session is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Interview session not found",
+        )
+
+    return {
+        "message": "Interview terminated successfully",
+        "session_id": terminated_session["session_id"],
+        "status": terminated_session["status"],
+        "evaluation_status": terminated_session.get("evaluation_status"),
+        "termination_reason": terminated_session.get("termination_reason"),
+        "proctoring_violation_count": terminated_session.get(
+            "proctoring_violation_count", 0
+        ),
+        "terminated_at": terminated_session.get("terminated_at"),
+        "transcript_preserved": True,
+    }
+
+
+# --------------------------------------------------
+# INTERVIEW REPORT
+# Evaluation is performed asynchronously after completion.
+# --------------------------------------------------
+
+@app.get("/interviews/{session_id}/report")
+def get_interview_report(session_id: str):
+    session = SessionManager.get_session(session_id)
+
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Interview session not found",
+        )
+
+    if session["status"] == "terminated":
+        raise HTTPException(
+            status_code=409,
+            detail="This interview was terminated. Its answers and transcript are retained, but no hiring evaluation or recommendation is generated.",
+        )
+
+    if session["status"] != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail="Interview must be completed before the report is available.",
+        )
+
+    evaluation_status = session.get("evaluation_status")
+    final_report = session.get("final_report")
+
+    if evaluation_status == "completed" and final_report:
+        return {
+            "message": "Interview report generated successfully",
+            "evaluation_status": "completed",
+            "report": final_report,
+        }
+
+    if evaluation_status in {"pending", "processing", "not_started"}:
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={
+                "message": "Interview completed. AI evaluation is still processing.",
+                "evaluation_status": evaluation_status,
+                "report": None,
+            },
+        )
+
+    if evaluation_status == "failed":
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "message": "The interview evaluation failed. Please check the backend logs.",
+                "evaluation_status": "failed",
+                "report": None,
+            },
+        )
+
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "message": "The interview report is not ready yet.",
+            "evaluation_status": evaluation_status or "unknown",
+            "report": None,
+        },
+    )
 
 
 # ==================================================

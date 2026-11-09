@@ -31,19 +31,38 @@ def serialize_interview(interview: Interview) -> dict:
 
     return {
         "session_id": interview.session_id,
+
         "candidate": {
             "id": candidate.id,
             "candidate_id": candidate.candidate_id,
             "name": candidate.candidate_name,
             "email": candidate.email,
         },
+
         "job_role": interview.job_role,
         "status": interview.status,
         "current_stage": interview.current_stage,
         "language": interview.language,
         "duration": interview.interview_duration,
+
+        # Evaluation information
+        "evaluation_status": interview.evaluation_status,
         "overall_score": interview.overall_score,
         "recommendation": interview.recommendation,
+
+        # Termination information
+        "termination_reason": interview.termination_reason,
+        "proctoring_violation_count": (
+            interview.proctoring_violation_count
+        ),
+        "terminated_at": interview.terminated_at,
+
+        # Proctoring information
+        "tab_switch_count": interview.tab_switch_count,
+        "proctoring_paused": interview.proctoring_paused,
+        "proctoring_events": interview.proctoring_events or [],
+
+        # Timestamps
         "created_at": interview.created_at,
         "start_time": interview.start_time,
         "end_time": interview.end_time,
@@ -60,7 +79,10 @@ def get_dashboard_statistics(
     db: Session = Depends(get_db),
     recruiter: Recruiter = Depends(get_current_recruiter),
 ):
-    total_interviews = db.query(Interview).count()
+    total_interviews = (
+        db.query(Interview)
+        .count()
+    )
 
     completed_interviews = (
         db.query(Interview)
@@ -82,6 +104,32 @@ def get_dashboard_statistics(
         .count()
     )
 
+    terminated_interviews = (
+        db.query(Interview)
+        .filter(Interview.status == "terminated")
+        .count()
+    )
+
+    evaluations_pending = (
+        db.query(Interview)
+        .filter(
+            Interview.status == "completed",
+            Interview.evaluation_status.in_(
+                ["pending", "processing"]
+            ),
+        )
+        .count()
+    )
+
+    evaluations_failed = (
+        db.query(Interview)
+        .filter(
+            Interview.status == "completed",
+            Interview.evaluation_status == "failed",
+        )
+        .count()
+    )
+
     average_score = (
         db.query(func.avg(Interview.overall_score))
         .filter(
@@ -96,8 +144,14 @@ def get_dashboard_statistics(
         "completed_interviews": completed_interviews,
         "in_progress_interviews": in_progress_interviews,
         "not_started_interviews": not_started_interviews,
-        "average_score": round(float(average_score), 2)
-        if average_score is not None else 0,
+        "terminated_interviews": terminated_interviews,
+        "evaluations_pending": evaluations_pending,
+        "evaluations_failed": evaluations_failed,
+        "average_score": (
+            round(float(average_score), 2)
+            if average_score is not None
+            else 0
+        ),
     }
 
 
@@ -108,7 +162,10 @@ def get_dashboard_statistics(
 @router.get("/interviews")
 def get_recruiter_interviews(
     search: str | None = Query(default=None),
-    interview_status: str | None = Query(default=None, alias="status"),
+    interview_status: str | None = Query(
+        default=None,
+        alias="status",
+    ),
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=10, ge=1, le=100),
     db: Session = Depends(get_db),
@@ -121,12 +178,16 @@ def get_recruiter_interviews(
     if search:
         search_term = f"%{search.strip()}%"
 
-        query = query.join(Interview.candidate).filter(
-            or_(
-                Candidate.candidate_name.ilike(search_term),
-                Candidate.email.ilike(search_term),
-                Interview.job_role.ilike(search_term),
-                Interview.session_id.ilike(search_term),
+        query = (
+            query
+            .join(Interview.candidate)
+            .filter(
+                or_(
+                    Candidate.candidate_name.ilike(search_term),
+                    Candidate.email.ilike(search_term),
+                    Interview.job_role.ilike(search_term),
+                    Interview.session_id.ilike(search_term),
+                )
             )
         )
 
@@ -172,10 +233,13 @@ def get_recruiter_interview_details(
         db.query(Interview)
         .options(
             joinedload(Interview.candidate),
+
             joinedload(Interview.questions)
             .joinedload(InterviewQuestion.answers),
+
             joinedload(Interview.questions)
             .joinedload(InterviewQuestion.evaluations),
+
             joinedload(Interview.evaluations),
         )
         .filter(Interview.session_id == session_id)
@@ -200,6 +264,8 @@ def get_recruiter_interview_details(
             "question_type": question.question_type,
             "sequence_number": question.sequence_number,
             "expected_concepts": question.expected_concepts,
+
+            # Preserve all submitted candidate answers
             "answers": [
                 {
                     "id": answer.id,
@@ -209,20 +275,32 @@ def get_recruiter_interview_details(
                 }
                 for answer in question.answers
             ],
+
+            # Question-level evaluations
             "evaluations": [
                 {
                     "id": evaluation.id,
-                    "technical_correctness": evaluation.technical_correctness,
+                    "technical_correctness": (
+                        evaluation.technical_correctness
+                    ),
                     "concept_coverage": evaluation.concept_coverage,
                     "reasoning_quality": evaluation.reasoning_quality,
-                    "communication_clarity": evaluation.communication_clarity,
-                    "answer_classification": evaluation.answer_classification,
+                    "communication_clarity": (
+                        evaluation.communication_clarity
+                    ),
+                    "answer_classification": (
+                        evaluation.answer_classification
+                    ),
                     "matched_concepts": evaluation.matched_concepts,
                     "missing_concepts": evaluation.missing_concepts,
-                    "incorrect_statements": evaluation.incorrect_statements,
+                    "incorrect_statements": (
+                        evaluation.incorrect_statements
+                    ),
                     "overall_feedback": evaluation.overall_feedback,
                     "confidence": evaluation.confidence,
-                    "complete_evaluation": evaluation.complete_evaluation_json,
+                    "complete_evaluation": (
+                        evaluation.complete_evaluation_json
+                    ),
                 }
                 for evaluation in question.evaluations
             ],
@@ -230,22 +308,55 @@ def get_recruiter_interview_details(
 
     return {
         **serialize_interview(interview),
+
+        # Interview information
         "job_description": interview.job_description,
         "summary": interview.summary,
+
+        # Preserve transcript even for terminated interviews
         "transcript": interview.transcript or [],
+
+        # Report and recommendation
         "final_report": interview.final_report,
+
+        # Proctoring details
+        "proctoring_paused": interview.proctoring_paused,
+        "proctoring_events": interview.proctoring_events or [],
+        "tab_switch_count": interview.tab_switch_count,
+        "proctoring_violation_count": (
+            interview.proctoring_violation_count
+        ),
+
+        # Termination details
+        "termination_reason": interview.termination_reason,
+        "terminated_at": interview.terminated_at,
+
+        # Evaluation status
+        "evaluation_status": interview.evaluation_status,
+
+        # Question and answer details
         "questions": questions,
+
+        # Interview-level evaluations
         "evaluations": [
             {
                 "id": evaluation.id,
-                "technical_correctness": evaluation.technical_correctness,
+                "technical_correctness": (
+                    evaluation.technical_correctness
+                ),
                 "concept_coverage": evaluation.concept_coverage,
                 "reasoning_quality": evaluation.reasoning_quality,
-                "communication_clarity": evaluation.communication_clarity,
-                "answer_classification": evaluation.answer_classification,
+                "communication_clarity": (
+                    evaluation.communication_clarity
+                ),
+                "answer_classification": (
+                    evaluation.answer_classification
+                ),
                 "overall_feedback": evaluation.overall_feedback,
                 "confidence": evaluation.confidence,
-                "complete_evaluation": evaluation.complete_evaluation_json,
+                "complete_evaluation": (
+                    evaluation.complete_evaluation_json
+                ),
                 "created_at": evaluation.created_at,
             }
             for evaluation in interview.evaluations

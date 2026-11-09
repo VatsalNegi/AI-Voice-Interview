@@ -6,16 +6,12 @@ import {
   Camera,
   CameraOff,
   Mic,
-  MicOff,
-  Send,
+  Mic2,
   Clock,
   BrainCircuit,
   CheckCircle,
   AlertCircle,
   Loader2,
-  Volume2,
-  Square,
-  Mic2,
 } from "lucide-react";
 
 import {
@@ -51,6 +47,12 @@ export default function LiveInterview() {
 
   const recognitionRef = useRef(null);
   const restartTimerRef = useRef(null);
+  const vadIntervalRef = useRef(null);
+  const audioContextRef = useRef(null);
+  const analyserRef = useRef(null);
+  const speechStartedRef = useRef(false);
+  const silenceStartedAtRef = useRef(null);
+  const autoSubmitLockRef = useRef(false);
 
   // Controls whether the candidate still wants recognition active
   const listeningWantedRef = useRef(false);
@@ -62,6 +64,13 @@ export default function LiveInterview() {
   const micEnabledRef = useRef(false);
   const submittingRef = useRef(false);
   const completedRef = useRef(false);
+
+  // Fullscreen proctoring refs.
+  const interviewStartedRef = useRef(false);
+  const pausedRef = useRef(false);
+  const violationCountRef = useRef(0);
+  const terminationRef = useRef(false);
+  const countdownTimerRef = useRef(null);
 
 
   // =========================================
@@ -92,6 +101,15 @@ export default function LiveInterview() {
 
   const [secondsElapsed, setSecondsElapsed] = useState(0);
 
+  // Fullscreen proctoring states.
+  const [proctoringReady, setProctoringReady] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
+  const [fullscreenWarning, setFullscreenWarning] = useState(false);
+  const [violationCount, setViolationCount] = useState(0);
+  const [countdown, setCountdown] = useState(8);
+  const [terminated, setTerminated] = useState(false);
+  const [proctoringMessage, setProctoringMessage] = useState("");
+
 
   // =========================================
   // AI VOICE STATES
@@ -115,6 +133,7 @@ export default function LiveInterview() {
   const [isListening, setIsListening] = useState(false);
   const [speechSupported, setSpeechSupported] = useState(false);
   const [speechError, setSpeechError] = useState("");
+  const [silenceCountdown, setSilenceCountdown] = useState(4);
 
 
   // Keep refs synchronized with current state
@@ -130,6 +149,195 @@ export default function LiveInterview() {
     completedRef.current = completed;
   }, [completed]);
 
+  useEffect(() => {
+    pausedRef.current = isPaused;
+  }, [isPaused]);
+
+  useEffect(() => {
+    violationCountRef.current = violationCount;
+  }, [violationCount]);
+
+
+  // =========================================
+  // FULLSCREEN PROCTORING
+  // =========================================
+
+  const stopInterviewActivity = () => {
+    stopListening();
+
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0;
+    }
+
+    if (vadIntervalRef.current) {
+      clearInterval(vadIntervalRef.current);
+      vadIntervalRef.current = null;
+    }
+
+    if (restartTimerRef.current) {
+      clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+    }
+  };
+
+  const terminateInterview = async (reason) => {
+    if (terminationRef.current) return;
+
+    terminationRef.current = true;
+    completedRef.current = true;
+    listeningWantedRef.current = false;
+
+    stopInterviewActivity();
+
+    if (countdownTimerRef.current) {
+      clearTimeout(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+    }
+
+    setFullscreenWarning(false);
+    setIsPaused(false);
+    setTerminated(true);
+    setProctoringMessage(reason);
+
+    // Stop local media immediately. The backend endpoint is added separately.
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+
+    try {
+      const baseUrl =
+        import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+
+      const response = await fetch(
+        `${baseUrl}/interviews/${sessionId}/terminate`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            reason,
+            violation_count: violationCountRef.current,
+          }),
+        }
+      );
+
+      if (!response.ok) {
+        console.error(
+          "Backend termination request failed:",
+          response.status,
+          await response.text()
+        );
+      }
+    } catch (err) {
+      console.error("Unable to persist interview termination:", err);
+    }
+  };
+
+  const enterFullscreenAndStart = async () => {
+    try {
+      if (!document.fullscreenElement) {
+        if (!document.documentElement.requestFullscreen) {
+          throw new Error("Fullscreen is not supported by this browser.");
+        }
+
+        await document.documentElement.requestFullscreen();
+      }
+
+      if (!document.fullscreenElement) {
+        throw new Error("Please allow fullscreen mode to start the interview.");
+      }
+
+      interviewStartedRef.current = true;
+      setProctoringReady(true);
+      setProctoringMessage("");
+    } catch (err) {
+      console.error("Fullscreen request failed:", err);
+      setProctoringMessage(
+        err.message ||
+          "Fullscreen could not be enabled. Please use a supported browser and try again."
+      );
+    }
+  };
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      if (
+        !interviewStartedRef.current ||
+        completedRef.current ||
+        terminationRef.current
+      ) {
+        return;
+      }
+
+      if (!document.fullscreenElement) {
+        // Ignore duplicate fullscreenchange events while a warning is active.
+        if (pausedRef.current) return;
+
+        const nextViolation = violationCountRef.current + 1;
+        violationCountRef.current = nextViolation;
+        setViolationCount(nextViolation);
+
+        stopInterviewActivity();
+
+        if (nextViolation > 2) {
+          terminateInterview(
+            "Interview terminated because the fullscreen warning limit was exceeded."
+          );
+          return;
+        }
+
+        pausedRef.current = true;
+        setIsPaused(true);
+        setFullscreenWarning(true);
+        setCountdown(8);
+
+        countdownTimerRef.current = setTimeout(() => {
+          countdownTimerRef.current = null;
+
+          if (
+            pausedRef.current &&
+            !document.fullscreenElement &&
+            !terminationRef.current
+          ) {
+            terminateInterview(
+              "Interview terminated because fullscreen was not restored within 8 seconds."
+            );
+          }
+        }, 8000);
+      } else if (pausedRef.current) {
+        if (countdownTimerRef.current) {
+          clearTimeout(countdownTimerRef.current);
+          countdownTimerRef.current = null;
+        }
+
+        pausedRef.current = false;
+        setIsPaused(false);
+        setFullscreenWarning(false);
+        setCountdown(8);
+      }
+    };
+
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+      if (countdownTimerRef.current) {
+        clearTimeout(countdownTimerRef.current);
+        countdownTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isPaused || !fullscreenWarning) return;
+
+    const interval = setInterval(() => {
+      setCountdown((previous) => Math.max(0, previous - 1));
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [isPaused, fullscreenWarning]);
 
   // =========================================
   // CAMERA AND MICROPHONE INITIALIZATION
@@ -253,6 +461,15 @@ export default function LiveInterview() {
   // =========================================
 
   const stopListening = () => {
+    // Stop silence detection together with speech recognition.
+    if (vadIntervalRef.current) {
+      clearInterval(vadIntervalRef.current);
+      vadIntervalRef.current = null;
+    }
+    speechStartedRef.current = false;
+    silenceStartedAtRef.current = null;
+    setSilenceCountdown(4);
+
     // Explicitly disable automatic restarting
     listeningWantedRef.current = false;
 
@@ -278,6 +495,117 @@ export default function LiveInterview() {
 
 
   // =========================================
+  // AUTOMATIC SILENCE DETECTION (4 SECONDS)
+  // =========================================
+
+  const startSilenceDetection = () => {
+    if (vadIntervalRef.current) {
+      clearInterval(vadIntervalRef.current);
+      vadIntervalRef.current = null;
+    }
+
+    const stream = streamRef.current;
+    if (!stream) return;
+
+    try {
+      const AudioContextClass =
+        window.AudioContext || window.webkitAudioContext;
+
+      if (!AudioContextClass) {
+        setSpeechError("Automatic silence detection is not supported in this browser.");
+        return;
+      }
+
+      if (!audioContextRef.current) {
+        audioContextRef.current = new AudioContextClass();
+        analyserRef.current = audioContextRef.current.createAnalyser();
+        analyserRef.current.fftSize = 2048;
+
+        const source = audioContextRef.current.createMediaStreamSource(stream);
+        source.connect(analyserRef.current);
+      }
+
+      const context = audioContextRef.current;
+      const analyser = analyserRef.current;
+
+      if (context.state === "suspended") {
+        context.resume();
+      }
+
+      const samples = new Uint8Array(analyser.fftSize);
+      speechStartedRef.current = false;
+      silenceStartedAtRef.current = null;
+      autoSubmitLockRef.current = false;
+      setSilenceCountdown(4);
+
+      vadIntervalRef.current = setInterval(() => {
+        if (
+          submittingRef.current ||
+          completedRef.current ||
+          pausedRef.current ||
+          !proctoringReady ||
+          !listeningWantedRef.current
+        ) {
+          return;
+        }
+
+        analyser.getByteTimeDomainData(samples);
+
+        let sumSquares = 0;
+        for (let i = 0; i < samples.length; i++) {
+          const normalized = (samples[i] - 128) / 128;
+          sumSquares += normalized * normalized;
+        }
+
+        const rms = Math.sqrt(sumSquares / samples.length);
+        const now = Date.now();
+
+        // A conservative threshold filters ordinary microphone noise.
+        if (rms > 0.025) {
+          speechStartedRef.current = true;
+          silenceStartedAtRef.current = null;
+          setSilenceCountdown(4);
+          return;
+        }
+
+        // Do not submit until the candidate has actually spoken.
+        if (!speechStartedRef.current) return;
+
+        if (silenceStartedAtRef.current === null) {
+          silenceStartedAtRef.current = now;
+        }
+
+        const silentFor = now - silenceStartedAtRef.current;
+        const remaining = Math.max(0, 4 - Math.floor(silentFor / 1000));
+        setSilenceCountdown(remaining);
+
+        if (silentFor >= 4000 && !autoSubmitLockRef.current) {
+          autoSubmitLockRef.current = true;
+          clearInterval(vadIntervalRef.current);
+          vadIntervalRef.current = null;
+
+          const finalAnswer = transcriptRef.current.trim();
+          if (finalAnswer) {
+            listeningWantedRef.current = false;
+            setIsListening(false);
+            handleSubmitAnswer();
+          } else {
+            autoSubmitLockRef.current = false;
+            speechStartedRef.current = false;
+            silenceStartedAtRef.current = null;
+            setSpeechError("I couldn't recognize your answer. Please speak again.");
+            startListening();
+          }
+        }
+      }, 100);
+    } catch (err) {
+      console.error("Silence detection initialization failed:", err);
+      setSpeechError("Unable to start automatic voice detection. Please refresh and try again.");
+    }
+  };
+
+
+  // =========================================
   // START SPEECH RECOGNITION
   // =========================================
 
@@ -295,12 +623,17 @@ export default function LiveInterview() {
 
     if (!micEnabledRef.current) {
       setSpeechError(
-        "Please enable your microphone before answering."
+        "The required microphone is unavailable. Please check browser permissions."
       );
       return;
     }
 
-    if (submittingRef.current || completedRef.current) {
+    if (
+      submittingRef.current ||
+      completedRef.current ||
+      pausedRef.current ||
+      !proctoringReady
+    ) {
       return;
     }
 
@@ -342,7 +675,9 @@ export default function LiveInterview() {
         !listeningWantedRef.current ||
         !micEnabledRef.current ||
         submittingRef.current ||
-        completedRef.current
+        completedRef.current ||
+        pausedRef.current ||
+        !proctoringReady
       ) {
         setIsListening(false);
         return;
@@ -407,6 +742,7 @@ export default function LiveInterview() {
           .join(" ");
 
         setAnswer(completeTranscript);
+        if (completeTranscript.trim()) speechStartedRef.current = true;
       };
 
 
@@ -429,7 +765,7 @@ export default function LiveInterview() {
           setIsListening(false);
 
           setSpeechError(
-            "Microphone permission denied. Please allow microphone access in your browser."
+            "Microphone permission denied. Allow microphone access and reload the interview."
           );
 
         } else if (event.error === "audio-capture") {
@@ -483,7 +819,9 @@ export default function LiveInterview() {
           listeningWantedRef.current &&
           micEnabledRef.current &&
           !submittingRef.current &&
-          !completedRef.current
+          !completedRef.current &&
+          !pausedRef.current &&
+          proctoringReady
         ) {
           console.log(
             "Recognition stopped unexpectedly. Restarting..."
@@ -498,7 +836,9 @@ export default function LiveInterview() {
               listeningWantedRef.current &&
               micEnabledRef.current &&
               !submittingRef.current &&
-              !completedRef.current
+              !completedRef.current &&
+              !pausedRef.current &&
+              proctoringReady
             ) {
               startRecognitionInstance();
             }
@@ -533,7 +873,9 @@ export default function LiveInterview() {
           listeningWantedRef.current &&
           micEnabledRef.current &&
           !submittingRef.current &&
-          !completedRef.current
+          !completedRef.current &&
+          !pausedRef.current &&
+          proctoringReady
         ) {
           restartTimerRef.current = setTimeout(() => {
             restartTimerRef.current = null;
@@ -561,7 +903,7 @@ export default function LiveInterview() {
   // =========================================
 
   useEffect(() => {
-    if (completed || loading) return;
+    if (completed || loading || !proctoringReady || isPaused || terminated) return;
 
     const timer = setInterval(() => {
       setSecondsElapsed((previous) => previous + 1);
@@ -569,7 +911,7 @@ export default function LiveInterview() {
 
     return () => clearInterval(timer);
 
-  }, [completed, loading]);
+  }, [completed, loading, proctoringReady, isPaused, terminated]);
 
 
   // =========================================
@@ -656,7 +998,14 @@ export default function LiveInterview() {
   // =========================================
 
   useEffect(() => {
-    if (!question || loading || completed) return;
+    if (
+      !question ||
+      loading ||
+      completed ||
+      !proctoringReady ||
+      isPaused ||
+      terminated
+    ) return;
 
     let cancelled = false;
 
@@ -696,8 +1045,9 @@ export default function LiveInterview() {
               "AI interviewer finished speaking."
             );
 
-            // Start candidate speech recognition
+            // Start candidate speech recognition and silence detection
             startListening();
+            startSilenceDetection();
           }
         };
 
@@ -740,7 +1090,7 @@ export default function LiveInterview() {
             setVoiceStatus("ready");
 
             setSpeechError(
-              "Click Play Question to hear the interviewer."
+              "Automatic playback was blocked. Please refresh the interview and allow audio playback."
             );
           }
         }
@@ -755,7 +1105,7 @@ export default function LiveInterview() {
           setVoiceStatus("error");
 
           setSpeechError(
-            "Unable to generate interviewer voice. You can still type your answer."
+            "Unable to generate interviewer voice. Please refresh the interview or contact the recruiter."
           );
         }
       }
@@ -781,95 +1131,23 @@ export default function LiveInterview() {
       }
     };
 
-  }, [question, loading, completed]);
-
-
-  // =========================================
-  // REPLAY INTERVIEW QUESTION
-  // =========================================
-
-  const handleReplayQuestion = async () => {
-    if (!audioRef.current) return;
-
-    // Stop candidate recognition while interviewer speaks
-    stopListening();
-
-    try {
-      audioRef.current.currentTime = 0;
-
-      await audioRef.current.play();
-
-      setVoiceStatus("speaking");
-      setSpeechError("");
-
-    } catch (err) {
-      console.error("Replay failed:", err);
-
-      setVoiceStatus("error");
-
-      setSpeechError(
-        "Unable to replay the interview question."
-      );
-    }
-  };
-
-
-  // =========================================
-  // CAMERA TOGGLE
-  // =========================================
-
-  const toggleCamera = () => {
-    if (!streamRef.current) return;
-
-    const videoTrack =
-      streamRef.current.getVideoTracks()[0];
-
-    if (videoTrack) {
-      videoTrack.enabled = !videoTrack.enabled;
-
-      setCameraEnabled(videoTrack.enabled);
-    }
-  };
-
-
-  // =========================================
-  // MICROPHONE TOGGLE
-  // =========================================
-
-  const toggleMicrophone = () => {
-    if (!streamRef.current) return;
-
-    const audioTrack =
-      streamRef.current.getAudioTracks()[0];
-
-    if (audioTrack) {
-      audioTrack.enabled = !audioTrack.enabled;
-
-      setMicEnabled(audioTrack.enabled);
-      micEnabledRef.current = audioTrack.enabled;
-
-      if (!audioTrack.enabled) {
-        stopListening();
-        setSpeechError(
-          "Microphone is disabled. Enable it to continue speaking."
-        );
-      }
-    }
-  };
+  }, [question, loading, completed, proctoringReady, isPaused, terminated]);
 
 
   // =========================================
   // SUBMIT CANDIDATE ANSWER
   // =========================================
 
-  const handleSubmitAnswer = async (event) => {
-    event.preventDefault();
+  const handleSubmitAnswer = async () => {
+    const finalAnswer = transcriptRef.current.trim() || answer.trim();
 
     if (
-      !answer.trim() ||
-      submitting ||
-      completed ||
-      isListening
+      !finalAnswer ||
+      submittingRef.current ||
+      completedRef.current ||
+      pausedRef.current ||
+      !proctoringReady ||
+      terminationRef.current
     ) {
       return;
     }
@@ -891,7 +1169,7 @@ export default function LiveInterview() {
     try {
       const response = await submitAnswer(
         sessionId,
-        answer.trim()
+        finalAnswer
       );
 
       console.log(
@@ -983,7 +1261,10 @@ export default function LiveInterview() {
 
       // Clear the previous candidate transcript
       transcriptRef.current = "";
-
+      speechStartedRef.current = false;
+      silenceStartedAtRef.current = null;
+      autoSubmitLockRef.current = false;
+      setSilenceCountdown(4);
       setAnswer("");
 
     } catch (err) {
@@ -1024,6 +1305,16 @@ export default function LiveInterview() {
         recognitionRef.current = null;
       }
 
+      if (vadIntervalRef.current) {
+        clearInterval(vadIntervalRef.current);
+        vadIntervalRef.current = null;
+      }
+
+      if (audioContextRef.current) {
+        audioContextRef.current.close().catch(() => {});
+        audioContextRef.current = null;
+      }
+
       if (audioRef.current) {
         audioRef.current.pause();
         audioRef.current = null;
@@ -1036,6 +1327,31 @@ export default function LiveInterview() {
     };
   }, []);
 
+
+  // =========================================
+  // TERMINATED INTERVIEW
+  // =========================================
+
+  if (terminated) {
+    return (
+      <div className="min-h-screen bg-[#07091b] text-white flex items-center justify-center p-6">
+        <div className="max-w-xl w-full bg-[#11182c] border border-red-500/30 rounded-2xl p-10 text-center">
+          <AlertCircle className="w-16 h-16 text-red-400 mx-auto mb-5" />
+          <h1 className="text-3xl font-bold mb-3">Interview Terminated</h1>
+          <p className="text-slate-300 mb-3">{proctoringMessage}</p>
+          <p className="text-slate-400 mb-7">
+            Your previously submitted answers have been retained.
+          </p>
+          <button
+            onClick={() => navigate("/")}
+            className="bg-purple-600 hover:bg-purple-700 px-7 py-3 rounded-xl font-semibold"
+          >
+            Back to Home
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   // =========================================
   // COMPLETED INTERVIEW
@@ -1097,6 +1413,70 @@ export default function LiveInterview() {
   return (
     <div className="min-h-screen bg-[#07091b] text-white">
 
+      {/* FULLSCREEN START GATE */}
+      {!proctoringReady && (
+        <div className="fixed inset-0 z-[100] bg-[#07091b]/95 backdrop-blur-sm flex items-center justify-center p-6">
+          <div className="max-w-lg w-full bg-[#11182c] border border-white/10 rounded-2xl p-8 text-center shadow-2xl">
+            <div className="w-16 h-16 rounded-2xl bg-purple-500/15 text-purple-300 flex items-center justify-center mx-auto mb-5">
+              <AlertCircle size={34} />
+            </div>
+            <h2 className="text-2xl font-bold mb-3">Fullscreen Required</h2>
+            <p className="text-slate-300 mb-4">
+              Your interview will start in fullscreen mode. Leaving fullscreen
+              will pause the interview and trigger a warning.
+            </p>
+            <p className="text-slate-400 text-sm mb-6">
+              You have two warnings. If you do not return within 8 seconds,
+              or exit fullscreen for a third time, the interview will be terminated.
+            </p>
+            {proctoringMessage && (
+              <p className="text-yellow-300 text-sm mb-4">{proctoringMessage}</p>
+            )}
+            <button
+              onClick={enterFullscreenAndStart}
+              disabled={loading || Boolean(error) || Boolean(permissionError)}
+              className="w-full bg-purple-600 hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed px-6 py-3 rounded-xl font-semibold"
+            >
+              Enable Fullscreen & Start Interview
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* FULLSCREEN EXIT WARNING */}
+      {fullscreenWarning && isPaused && (
+        <div className="fixed inset-0 z-[110] bg-black/90 backdrop-blur-md flex items-center justify-center p-6">
+          <div className="max-w-md w-full bg-[#11182c] border border-yellow-500/40 rounded-2xl p-8 text-center shadow-2xl">
+            <AlertCircle className="w-14 h-14 text-yellow-400 mx-auto mb-4" />
+            <p className="text-yellow-300 text-sm font-semibold mb-2">
+              WARNING {violationCount} OF 2
+            </p>
+            <h2 className="text-2xl font-bold mb-3">Return to Fullscreen</h2>
+            <p className="text-slate-300 mb-5">
+              Your interview is paused. Return to fullscreen immediately to continue.
+            </p>
+            <div className="text-5xl font-bold font-mono text-yellow-300 mb-5">
+              00:{String(countdown).padStart(2, "0")}
+            </div>
+            <button
+              onClick={async () => {
+                try {
+                  await document.documentElement.requestFullscreen();
+                } catch (err) {
+                  console.error("Could not restore fullscreen:", err);
+                }
+              }}
+              className="w-full bg-purple-600 hover:bg-purple-700 px-6 py-3 rounded-xl font-semibold"
+            >
+              Return to Fullscreen
+            </button>
+            <p className="text-slate-500 text-xs mt-4">
+              If the countdown reaches zero, your interview will be terminated.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* HEADER */}
 
       <header className="border-b border-white/10 px-6 py-4 flex items-center justify-between">
@@ -1127,6 +1507,11 @@ export default function LiveInterview() {
       {/* MAIN CONTENT */}
 
       <main className="max-w-7xl mx-auto p-6">
+        {isPaused && (
+          <div className="mb-5 rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-4 text-yellow-200">
+            Interview paused — return to fullscreen to continue.
+          </div>
+        )}
 
         {/* CANDIDATE DETAILS AND TIMER */}
 
@@ -1198,7 +1583,7 @@ export default function LiveInterview() {
                 Candidate Camera
               </h3>
 
-
+              
             </div>
 
 
@@ -1229,38 +1614,20 @@ export default function LiveInterview() {
             </div>
 
 
-            {/* CAMERA AND MICROPHONE BUTTONS */}
-
-            <div className="flex justify-center gap-5 mt-5">
-
-              <button
-                onClick={toggleCamera}
-                type="button"
-                className="p-4 bg-[#202b42] hover:bg-purple-700 rounded-full"
-                title="Toggle camera"
-              >
-                {cameraEnabled ? <Camera /> : <CameraOff />}
-              </button>
-
-
-              <button
-                onClick={toggleMicrophone}
-                type="button"
-                className="p-4 bg-[#202b42] hover:bg-purple-700 rounded-full"
-                title="Toggle microphone"
-              >
-                {micEnabled ? <Mic /> : <MicOff />}
-              </button>
-
+            <div className="flex justify-center gap-3 mt-5">
+              <div className="flex items-center gap-2 rounded-lg bg-green-500/10 border border-green-500/20 px-4 py-2 text-sm text-green-300">
+                <Camera size={17} />
+                Camera required
+              </div>
+              <div className="flex items-center gap-2 rounded-lg bg-green-500/10 border border-green-500/20 px-4 py-2 text-sm text-green-300">
+                <Mic size={17} />
+                Microphone locked
+              </div>
             </div>
 
-
             <p className="text-xs text-center text-slate-500 mt-4">
-
-              Camera preview and microphone access are enabled.
-
-              Video recording is not implemented yet.
-
+              Camera and microphone controls are locked during the interview.
+              Camera preview is active; video is not recorded or stored.
             </p>
 
           </section>
@@ -1301,219 +1668,68 @@ export default function LiveInterview() {
               </h2>
 
 
-              {/* AI VOICE CONTROL */}
-
-              <div className="mt-5 flex flex-wrap items-center gap-3">
-
-                <button
-                  type="button"
-                  onClick={handleReplayQuestion}
-                  disabled={
-                    !audioRef.current ||
-                    voiceStatus === "generating" ||
-                    !question
-                  }
-                  className="bg-purple-600 hover:bg-purple-700 disabled:opacity-50 px-5 py-3 rounded-xl flex items-center gap-2 font-medium"
-                >
-
-                  <Volume2 size={18} />
-
-                  {voiceStatus === "generating"
-                    ? "Generating Voice..."
-                    : voiceStatus === "speaking"
-                    ? "Speaking..."
-                    : "Play Question"}
-
-                </button>
-
-
-                <span className="text-sm text-slate-400">
-
-                  {voiceStatus === "idle" &&
-                    "Waiting for voice"}
-
-                  {voiceStatus === "generating" &&
-                    "Preparing interviewer voice"}
-
-                  {voiceStatus === "speaking" &&
-                    "AI interviewer is speaking"}
-
-                  {voiceStatus === "ready" &&
-                    "Voice ready"}
-
-                  {voiceStatus === "error" &&
-                    "Voice unavailable"}
-
-                </span>
-
-              </div>
 
             </div>
 
 
-            {/* ANSWER FORM */}
+            {/* VOICE-ONLY ANSWER STATUS */}
 
-            <form onSubmit={handleSubmitAnswer}>
-
-              <div className="flex justify-between items-center mb-3">
-
-                <label className="block text-sm font-medium">
-                  Your Answer
-                </label>
-
-                {isListening && (
+            <div className="rounded-xl border border-white/10 bg-[#07091b] p-6">
+              <div className="flex items-center justify-between mb-4">
+                <span className="text-sm font-semibold">VOICE RESPONSE</span>
+                {isListening ? (
                   <span className="flex items-center gap-2 text-red-400 text-sm">
-
                     <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
-
-                    Listening...
-
+                    Listening
                   </span>
+                ) : submitting ? (
+                  <span className="text-purple-300 text-sm">Evaluating answer...</span>
+                ) : (
+                  <span className="text-slate-400 text-sm">Waiting</span>
                 )}
-
               </div>
 
+              <div className="flex flex-col items-center text-center py-5">
+                <div className={`w-20 h-20 rounded-full flex items-center justify-center mb-4 ${
+                  isListening ? "bg-red-500/15 text-red-400" : "bg-purple-500/15 text-purple-300"
+                }`}>
+                  {submitting ? (
+                    <Loader2 className="animate-spin" size={34} />
+                  ) : (
+                    <Mic2 size={34} />
+                  )}
+                </div>
 
-              {/* ANSWER TEXTAREA */}
+                <p className="text-lg font-semibold mb-2">
+                  {isPaused
+                    ? "Interview paused"
+                    : voiceStatus === "speaking"
+                    ? "Please listen to the question"
+                    : isListening
+                    ? "Please speak your answer"
+                    : submitting
+                    ? "Processing your response"
+                    : "Preparing your response"}
+                </p>
 
-              <textarea
-                value={answer}
-                onChange={(event) => {
-                  setAnswer(event.target.value);
-                  transcriptRef.current = event.target.value;
-                }}
-                placeholder={
-                  isListening
-                    ? "Speak your answer. Your recognized speech will appear here..."
-                    : "Your recognized answer will appear here, or type your answer..."
-                }
-                rows={9}
-                maxLength={10000}
-                required
-                disabled={submitting || !question}
-                className="w-full bg-[#07091b] border border-white/10 rounded-xl p-4 text-white placeholder-slate-500 outline-none focus:border-purple-500 resize-none"
-              />
-
-
-              {/* SPEECH ERROR */}
+                <p className="text-sm text-slate-400">
+                  {isPaused
+                    ? "Return to fullscreen to continue the interview."
+                    : isListening
+                    ? speechStartedRef.current
+                      ? `Silence detected. Auto-submit in ${silenceCountdown} seconds.`
+                      : "Start speaking when you are ready. The silence timer starts after your voice is detected."
+                    : "Your answer is captured automatically. No typing or manual submission is required."}
+                </p>
+              </div>
 
               {speechError && (
                 <div className="mt-3 p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/20 text-yellow-300 text-sm flex gap-2">
-
                   <AlertCircle size={18} className="shrink-0" />
-
                   {speechError}
-
                 </div>
               )}
-
-
-              {/* SPEECH CONTROLS */}
-
-              <div className="flex flex-wrap gap-3 mt-4">
-
-                {!isListening ? (
-
-                  <button
-                    type="button"
-                    onClick={startListening}
-                    disabled={
-                      !speechSupported ||
-                      !micEnabled ||
-                      submitting ||
-                      !question
-                    }
-                    className="flex-1 bg-[#202b42] hover:bg-purple-700 disabled:opacity-50 px-4 py-3 rounded-xl flex justify-center items-center gap-2 font-semibold"
-                  >
-
-                    <Mic2 size={19} />
-
-                    Start Speaking
-
-                  </button>
-
-                ) : (
-
-                  <button
-                    type="button"
-                    onClick={stopListening}
-                    className="flex-1 bg-red-600 hover:bg-red-700 px-4 py-3 rounded-xl flex justify-center items-center gap-2 font-semibold"
-                  >
-
-                    <Square size={17} />
-
-                    Stop Answer
-
-                  </button>
-
-                )}
-
-              </div>
-
-
-              {/* BROWSER SUPPORT */}
-
-              {!speechSupported && (
-                <p className="text-xs text-yellow-300 mt-3">
-
-                  Use the latest Chrome or Edge browser for speech recognition.
-                  You can still type your answer.
-
-                </p>
-              )}
-
-
-              {/* ANSWER COUNTER */}
-
-              <div className="flex justify-between items-center mt-4 mb-5 text-xs text-slate-500">
-
-                <span>
-                  {isListening
-                    ? "Speak clearly. Recognition will restart if the browser stops it."
-                    : "Review your answer before submitting."}
-                </span>
-
-                <span>
-                  {answer.length}/10000
-                </span>
-
-              </div>
-
-
-              {/* SUBMIT BUTTON */}
-
-              <button
-                type="submit"
-                disabled={
-                  !answer.trim() ||
-                  submitting ||
-                  isListening ||
-                  !question
-                }
-                className="w-full bg-purple-600 hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed py-4 rounded-xl font-semibold flex justify-center items-center gap-2"
-              >
-
-                {submitting ? (
-
-                  <>
-                    <Loader2 className="animate-spin" size={20} />
-
-                    Evaluating Answer...
-                  </>
-
-                ) : (
-
-                  <>
-                    Submit Answer
-
-                    <Send size={18} />
-                  </>
-
-                )}
-
-              </button>
-
-            </form>
+            </div>
 
           </section>
 
