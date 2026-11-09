@@ -34,7 +34,7 @@ from app.schemas.interview import (
 
 from app.services.tts_service import TTSService
 from app.services.session_manager import SessionManager
-from app.services.post_interview_evaluator import PostInterviewEvaluator
+
 
 
 class InterviewTerminationRequest(BaseModel):
@@ -298,10 +298,12 @@ async def submit_candidate_answer(
         # The live interview has finished. Run the AI evaluation after
         # the response is prepared, so the candidate does not wait for it.
         if result.get("status") == "completed":
+            from app.services.post_interview_evaluator import PostInterviewEvaluator
+
             background_tasks.add_task(
-                PostInterviewEvaluator.run,
-                session_id,
-            )
+        PostInterviewEvaluator.run,
+        session_id,
+    )
 
         return {
             "message": "Answer submitted successfully",
