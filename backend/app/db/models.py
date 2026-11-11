@@ -16,6 +16,10 @@ from sqlalchemy.orm import relationship
 from app.db.session import Base
 
 
+# ============================================================
+# RECRUITER
+# ============================================================
+
 class Recruiter(Base):
     __tablename__ = "recruiters"
 
@@ -39,6 +43,10 @@ class Recruiter(Base):
     )
 
 
+# ============================================================
+# CANDIDATE
+# ============================================================
+
 class Candidate(Base):
     __tablename__ = "candidates"
 
@@ -61,6 +69,10 @@ class Candidate(Base):
     )
 
 
+# ============================================================
+# INTERVIEW
+# ============================================================
+
 class Interview(Base):
     __tablename__ = "interviews"
 
@@ -77,6 +89,14 @@ class Interview(Base):
         Integer,
         ForeignKey("candidates.id", ondelete="CASCADE"),
         nullable=False,
+        index=True,
+    )
+
+    # Recruiter ownership
+    recruiter_id = Column(
+        Integer,
+        ForeignKey("recruiters.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
     )
 
@@ -103,9 +123,43 @@ class Interview(Base):
     end_time = Column(DateTime(timezone=True), nullable=True)
     overall_score = Column(Float, nullable=True)
 
-    # =========================================
+    # ========================================================
+    # QUESTION PREPARATION
+    # ========================================================
+
+    preparation_status = Column(
+        String(50),
+        nullable=False,
+        default="pending",
+        server_default="pending",
+        index=True,
+    )
+
+    preparation_error = Column(
+        Text,
+        nullable=True,
+    )
+
+    prepared_at = Column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    total_questions = Column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+
+    blueprint_metadata = Column(
+        JSON,
+        nullable=True,
+    )
+
+    # ========================================================
     # POST-INTERVIEW EVALUATION STATUS
-    # =========================================
+    # ========================================================
 
     evaluation_status = Column(
         String(50),
@@ -115,9 +169,9 @@ class Interview(Base):
         index=True,
     )
 
-    # =========================================
+    # ========================================================
     # INTERVIEW PROCTORING
-    # =========================================
+    # ========================================================
 
     tab_switch_count = Column(
         Integer,
@@ -137,9 +191,9 @@ class Interview(Base):
         nullable=False,
     )
 
-    # =========================================
+    # ========================================================
     # INTERVIEW TERMINATION
-    # =========================================
+    # ========================================================
 
     termination_reason = Column(
         Text,
@@ -158,9 +212,9 @@ class Interview(Base):
         nullable=True,
     )
 
-    # =========================================
+    # ========================================================
     # PERSISTENT RUNTIME SESSION STATE
-    # =========================================
+    # ========================================================
 
     consecutive_unsuccessful_answers = Column(
         Integer,
@@ -239,9 +293,9 @@ class Interview(Base):
         nullable=False,
     )
 
-    # =========================================
+    # ========================================================
     # RELATIONSHIPS
-    # =========================================
+    # ========================================================
 
     candidate = relationship(
         "Candidate",
@@ -263,6 +317,10 @@ class Interview(Base):
     )
 
 
+# ============================================================
+# INTERVIEW QUESTIONS
+# ============================================================
+
 class InterviewQuestion(Base):
     __tablename__ = "interview_questions"
 
@@ -273,6 +331,28 @@ class InterviewQuestion(Base):
         ForeignKey("interviews.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
+    )
+
+    # Question bank reference
+    master_question_id = Column(
+        String(100),
+        nullable=True,
+        index=True,
+    )
+
+    question_bank_version = Column(
+        String(50),
+        nullable=True,
+    )
+
+    metadata_snapshot = Column(
+        JSON,
+        nullable=True,
+    )
+
+    estimated_time_seconds = Column(
+        Integer,
+        nullable=True,
     )
 
     question_id = Column(
@@ -299,12 +379,19 @@ class InterviewQuestion(Base):
 
     expected_concepts = Column(JSON, nullable=True)
 
+    # Question presentation tracking
+    asked_at = Column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
     created_at = Column(
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
     )
 
+    # Relationships
     interview = relationship(
         "Interview",
         back_populates="questions",
@@ -323,6 +410,10 @@ class InterviewQuestion(Base):
         cascade="all, delete-orphan",
     )
 
+
+# ============================================================
+# CANDIDATE ANSWERS
+# ============================================================
 
 class CandidateAnswer(Base):
     __tablename__ = "candidate_answers"
@@ -355,6 +446,10 @@ class CandidateAnswer(Base):
         back_populates="answers",
     )
 
+
+# ============================================================
+# EVALUATIONS
+# ============================================================
 
 class Evaluation(Base):
     __tablename__ = "evaluations"
@@ -405,7 +500,11 @@ class Evaluation(Base):
 
     overall_feedback = Column(Text, nullable=True)
     confidence = Column(String(50), nullable=True)
-    complete_evaluation_json = Column(JSON, nullable=True)
+
+    complete_evaluation_json = Column(
+        JSON,
+        nullable=True,
+    )
 
     created_at = Column(
         DateTime(timezone=True),
@@ -413,6 +512,7 @@ class Evaluation(Base):
         nullable=False,
     )
 
+    # Relationships
     interview = relationship(
         "Interview",
         back_populates="evaluations",

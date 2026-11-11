@@ -3,47 +3,39 @@
 .env
 .env.*
 !.env.example
-**/.env
-**/.env.*
-!**/.env.example
+!.env.sample
 
 # Python
 __pycache__/
 *.py[cod]
 *.pyo
-*.pyd
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
 .venv/
 venv/
-env/
+.pytest_cache/
+.mypy_cache/
 
-# Generated audio and media
-*.mp3
-*.wav
-*.mp4
-*.webm
-*.m4a
-
-# Frontend dependencies
+# Node
 node_modules/
-frontend/node_modules/
-
-# Build outputs
 dist/
 build/
-coverage/
 
-# IDE and OS files
+# IDE
 .vscode/
 .idea/
-.DS_Store
-Thumbs.db
 
 # Logs
 *.log
 
 # Temporary files
 *.tmp
-*.bak
+.DS_Store
+Thumbs.db
+
+# Test and coverage
+.coverage
+htmlcov/
+
+# Local databases and uploads
+*.db
+*.sqlite3
+uploads/

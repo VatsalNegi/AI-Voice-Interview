@@ -4,8 +4,6 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import joinedload
 
 from app.schemas.interview import InterviewSessionCreate
-from app.engine.question_selector import QuestionSelector
-from app.config.question_bank import QUESTION_BANK
 from app.db.session import get_db_context
 from app.db.models import (
     Candidate,
@@ -54,7 +52,11 @@ class SessionManager:
             if q.question_type == "primary"
         ]
 
-        asked_question_ids = [q.question_id for q in primary_questions]
+        asked_question_ids = [
+            q.question_id
+            for q in primary_questions
+            if q.asked_at is not None
+        ]
 
         answered_question_ids = [
             q.question_id
@@ -88,12 +90,17 @@ class SessionManager:
 
         questions_metadata = {}
         for question_record in interview.questions:
+            metadata = question_record.metadata_snapshot or {}
             questions_metadata[question_record.question_id] = {
                 "question_id": question_record.question_id,
                 "question": question_record.question_text,
                 "competency": question_record.competency,
                 "difficulty": question_record.difficulty,
                 "expected_concepts": question_record.expected_concepts or [],
+                "sequence_number": question_record.sequence_number,
+                "stage": metadata.get("stage", "technical_interview"),
+                "stage_label": metadata.get("stage_label", "Technical Interview"),
+                "candidate_branch": metadata.get("candidate_branch"),
             }
 
         return {
@@ -103,6 +110,14 @@ class SessionManager:
             "language": interview.language,
             "status": interview.status,
             "evaluation_status": interview.evaluation_status,
+            "preparation_status": interview.preparation_status,
+            "preparation_error": interview.preparation_error,
+            "prepared_at": (
+                interview.prepared_at.isoformat()
+                if interview.prepared_at
+                else None
+            ),
+            "total_questions": interview.total_questions or 0,
             "termination_reason": interview.termination_reason,
             "proctoring_violation_count": interview.proctoring_violation_count or 0,
             "terminated_at": (
@@ -163,74 +178,40 @@ class SessionManager:
         interview.transcript = transcript
 
     @staticmethod
-    def _select_next_predefined_question(
-        current_stage: str,
-        asked_question_ids: list[str],
-    ):
-        """
-        Select the next unanswered question from QUESTION_BANK.
+    def _question_record_to_dict(question_record: InterviewQuestion) -> dict:
+        """Convert a persisted question into the runtime/API representation."""
+        metadata = question_record.metadata_snapshot or {}
 
-        This method deliberately does not generate resume-based questions
-        or AI follow-up questions.
-        """
-        stages = list(QUESTION_BANK.keys())
-
-        if not stages:
-            return None, None
-
-        if current_stage not in stages:
-            current_stage = stages[0]
-
-        current_index = stages.index(current_stage)
-
-        # First, exhaust the current stage.
-        question = QuestionSelector.select_next_question(
-            stage=current_stage,
-            asked_question_ids=asked_question_ids,
-        )
-        if question is not None:
-            return question, current_stage
-
-        # Then move forward through the remaining predefined stages.
-        for stage in stages[current_index + 1:]:
-            question = QuestionSelector.select_next_question(
-                stage=stage,
-                asked_question_ids=asked_question_ids,
-            )
-            if question is not None:
-                return question, stage
-
-        return None, None
+        return {
+            "question_id": question_record.question_id,
+            "question": question_record.question_text,
+            "competency": question_record.competency,
+            "difficulty": question_record.difficulty,
+            "expected_concepts": question_record.expected_concepts or [],
+            "estimated_time_seconds": question_record.estimated_time_seconds,
+            "sequence_number": question_record.sequence_number,
+            "question_type": question_record.question_type,
+            # Defaults preserve compatibility with questions prepared before
+            # stage metadata was introduced.
+            "stage": metadata.get("stage", "technical_interview"),
+            "stage_label": metadata.get("stage_label", "Technical Interview"),
+            "candidate_branch": metadata.get("candidate_branch"),
+        }
 
     @staticmethod
-    def _store_question_record(
-        db,
-        interview: Interview,
-        question: dict,
-        stage: str,
-    ):
-        """Persist a selected predefined question and make it current."""
-        sequence_number = (
-            db.query(InterviewQuestion)
-            .filter(InterviewQuestion.interview_id == interview.id)
-            .count()
-            + 1
-        )
+    def _activate_question(interview: Interview, question_record: InterviewQuestion):
+        """Activate a saved question and set its prepared interview stage."""
+        now_dt = datetime.now(timezone.utc)
+        question_record.asked_at = now_dt
+        question = SessionManager._question_record_to_dict(question_record)
 
-        question_record = InterviewQuestion(
-            interview_id=interview.id,
-            question_id=question["question_id"],
-            question_text=question["question"],
-            competency=question.get("competency"),
-            difficulty=question.get("difficulty"),
-            question_type="primary",
-            sequence_number=sequence_number,
-            expected_concepts=question.get("expected_concepts"),
+        # Stage is determined during preparation and stored with the question.
+        # The live interview does not call an LLM to determine the stage.
+        interview.current_stage = question.get(
+            "stage",
+            "technical_interview",
         )
-        db.add(question_record)
-
-        interview.current_stage = stage
-        interview.current_question_id = question["question_id"]
+        interview.current_question_id = question_record.question_id
         interview.current_question_metadata = question
         interview.current_followup = None
         interview.followup_count = 0
@@ -250,9 +231,7 @@ class SessionManager:
         with get_db_context() as db:
             candidate = (
                 db.query(Candidate)
-                .filter(
-                    Candidate.candidate_id == candidate_data["candidate_id"]
-                )
+                .filter(Candidate.candidate_id == candidate_data["candidate_id"])
                 .first()
             )
 
@@ -281,15 +260,16 @@ class SessionManager:
                 language=session_data.language,
                 status="not_started",
                 evaluation_status="not_started",
-                current_stage=(
-                    next(iter(QUESTION_BANK.keys()))
-                    if QUESTION_BANK
-                    else "introduction"
-                ),
+                preparation_status="pending",
+                preparation_error=None,
+                prepared_at=None,
+                total_questions=0,
+                blueprint_metadata=None,
+                current_stage="preparation",
                 consecutive_unsuccessful_answers=0,
                 resume_mode=False,
                 resume_questions_generated=0,
-                standard_stage_before_resume="introduction",
+                standard_stage_before_resume="preparation",
                 current_question_id=None,
                 current_question_metadata=None,
                 current_followup=None,
@@ -300,7 +280,6 @@ class SessionManager:
             )
             db.add(interview)
             db.flush()
-
             db.refresh(interview)
             session_dict = SessionManager._model_to_session_dict(interview)
 
@@ -314,18 +293,28 @@ class SessionManager:
     @staticmethod
     def start_session(session_id: str):
         with get_db_context() as db:
+            # Lock only the interviews row. Applying FOR UPDATE to the eager-loaded
+            # query below would also affect nullable LEFT OUTER JOIN targets, which
+            # PostgreSQL rejects. The row lock remains held for this transaction.
+            locked_interview_id = (
+                db.query(Interview.id)
+                .filter(Interview.session_id == session_id)
+                .with_for_update()
+                .scalar()
+            )
+
+            if locked_interview_id is None:
+                return None
+
+            # Load relationships separately, without FOR UPDATE on the joins.
             interview = (
                 db.query(Interview)
                 .options(
                     joinedload(Interview.candidate),
-                    joinedload(Interview.questions).joinedload(
-                        InterviewQuestion.answers
-                    ),
-                    joinedload(Interview.evaluations).joinedload(
-                        Evaluation.question
-                    ),
+                    joinedload(Interview.questions).joinedload(InterviewQuestion.answers),
+                    joinedload(Interview.evaluations).joinedload(Evaluation.question),
                 )
-                .filter(Interview.session_id == session_id)
+                .filter(Interview.id == locked_interview_id)
                 .first()
             )
 
@@ -333,27 +322,36 @@ class SessionManager:
                 return None
 
             if interview.status != "not_started":
-                raise ValueError(
-                    "Interview has already been started or completed."
+                raise ValueError("Interview has already been started or completed.")
+
+            if interview.preparation_status != "ready":
+                if interview.preparation_status == "failed":
+                    detail = interview.preparation_error or "Question preparation failed."
+                    raise ValueError(f"Interview preparation failed: {detail}")
+                raise ValueError("Interview questions are still being prepared. Please wait.")
+
+            first_question = (
+                db.query(InterviewQuestion)
+                .filter(
+                    InterviewQuestion.interview_id == interview.id,
+                    InterviewQuestion.question_type == "primary",
                 )
-
-            first_stage = (
-                next(iter(QUESTION_BANK.keys()))
-                if QUESTION_BANK
-                else None
-            )
-            if first_stage is None:
-                raise ValueError("The predefined question bank is empty.")
-
-            first_question = QuestionSelector.select_next_question(
-                stage=first_stage,
-                asked_question_ids=[],
+                .order_by(InterviewQuestion.sequence_number.asc())
+                .first()
             )
 
             if first_question is None:
-                raise ValueError(
-                    f"No questions available for stage: {first_stage}"
+                raise ValueError("No prepared interview questions were found.")
+
+            if interview.total_questions and interview.total_questions != (
+                db.query(InterviewQuestion)
+                .filter(
+                    InterviewQuestion.interview_id == interview.id,
+                    InterviewQuestion.question_type == "primary",
                 )
+                .count()
+            ):
+                raise ValueError("Prepared question set is incomplete. Please contact the recruiter.")
 
             now_dt = datetime.now(timezone.utc)
             interview.status = "in_progress"
@@ -361,16 +359,10 @@ class SessionManager:
             interview.start_time = now_dt
             interview.end_time = None
 
-            SessionManager._store_question_record(
-                db=db,
-                interview=interview,
-                question=first_question,
-                stage=first_stage,
-            )
+            SessionManager._activate_question(interview, first_question)
 
             db.flush()
             db.refresh(interview)
-
             session_dict = SessionManager._model_to_session_dict(interview)
 
         active_sessions[session_id] = session_dict
@@ -382,30 +374,34 @@ class SessionManager:
 
     @staticmethod
     async def submit_answer(session_id: str, answer_text: str):
-        """
-        Save the candidate's answer and select the next predefined question.
-
-        No LLM call, answer evaluation, decision-engine call, follow-up
-        generation, or report generation occurs during the live interview.
-        """
+        """Persist an answer and activate the next pre-generated question."""
         if not answer_text or not answer_text.strip():
             raise ValueError("Candidate answer cannot be empty.")
 
         answer_text = answer_text.strip()
 
         with get_db_context() as db:
+            # Lock only the parent interview row. Do not combine FOR UPDATE with
+            # joinedload() outer joins on PostgreSQL.
+            locked_interview_id = (
+                db.query(Interview.id)
+                .filter(Interview.session_id == session_id)
+                .with_for_update()
+                .scalar()
+            )
+
+            if locked_interview_id is None:
+                raise ValueError("Interview session not found.")
+
+            # Load related records after acquiring the parent-row lock.
             interview = (
                 db.query(Interview)
                 .options(
                     joinedload(Interview.candidate),
-                    joinedload(Interview.questions).joinedload(
-                        InterviewQuestion.answers
-                    ),
-                    joinedload(Interview.evaluations).joinedload(
-                        Evaluation.question
-                    ),
+                    joinedload(Interview.questions).joinedload(InterviewQuestion.answers),
+                    joinedload(Interview.evaluations).joinedload(Evaluation.question),
                 )
-                .filter(Interview.session_id == session_id)
+                .filter(Interview.id == locked_interview_id)
                 .first()
             )
 
@@ -415,11 +411,9 @@ class SessionManager:
             if interview.status != "in_progress":
                 raise ValueError("Interview is not currently in progress.")
 
-            question = interview.current_question_metadata
-            if not question:
+            question_id = interview.current_question_id
+            if not question_id:
                 raise ValueError("No active question found.")
-
-            question_id = question["question_id"]
 
             question_record = (
                 db.query(InterviewQuestion)
@@ -428,59 +422,55 @@ class SessionManager:
                     InterviewQuestion.question_id == question_id,
                     InterviewQuestion.question_type == "primary",
                 )
-                .order_by(InterviewQuestion.sequence_number.desc())
                 .first()
             )
 
-            if question_record is None:
-                raise ValueError(
-                    f"Question {question_id} was not found in the database."
-                )
+            if question_record is None or question_record.asked_at is None:
+                raise ValueError("The active question was not found or was not activated.")
+
+            # Prevent duplicate answer submission for the same active question.
+            existing_answer = (
+                db.query(CandidateAnswer)
+                .filter(CandidateAnswer.question_id == question_record.id)
+                .first()
+            )
+            if existing_answer is not None:
+                raise ValueError("An answer has already been submitted for this question.")
 
             now_dt = datetime.now(timezone.utc)
-
-            # Persist the candidate's answer.
-            answer_record = CandidateAnswer(
-                question_id=question_record.id,
-                answer_text=answer_text,
-                answer_type="initial",
-                created_at=now_dt,
-            )
-            db.add(answer_record)
-
-            # Append the answer to the transcript.
-            transcript = list(interview.transcript or [])
-            transcript.append(
-                {
-                    "speaker": "candidate",
-                    "type": "answer",
-                    "question_id": question_id,
-                    "text": answer_text,
-                    "timestamp": now_dt.isoformat(),
-                }
-            )
-            interview.transcript = transcript
-
-            current_answers = list(interview.current_question_answers or [])
-            current_answers.append(answer_text)
-            interview.current_question_answers = current_answers
-
-            # The question just answered is already stored in interview.questions.
-            asked_question_ids = [
-                item.question_id
-                for item in interview.questions
-                if item.question_type == "primary"
-            ]
-
-            next_question, next_stage = (
-                SessionManager._select_next_predefined_question(
-                    current_stage=interview.current_stage,
-                    asked_question_ids=asked_question_ids,
+            db.add(
+                CandidateAnswer(
+                    question_id=question_record.id,
+                    answer_text=answer_text,
+                    answer_type="initial",
+                    created_at=now_dt,
                 )
+            )
+
+            transcript = list(interview.transcript or [])
+            transcript.append({
+                "speaker": "candidate",
+                "type": "answer",
+                "question_id": question_id,
+                "text": answer_text,
+                "timestamp": now_dt.isoformat(),
+            })
+            interview.transcript = transcript
+            interview.current_question_answers = [answer_text]
+
+            # Select the next saved question that has not yet been asked.
+            next_question = (
+                db.query(InterviewQuestion)
+                .filter(
+                    InterviewQuestion.interview_id == interview.id,
+                    InterviewQuestion.question_type == "primary",
+                    InterviewQuestion.asked_at.is_(None),
+                )
+                .order_by(InterviewQuestion.sequence_number.asc())
+                .first()
             )
 
             if next_question is None:
-                # All predefined questions have been answered.
                 interview.status = "completed"
                 interview.evaluation_status = "pending"
                 interview.end_time = now_dt
@@ -495,10 +485,7 @@ class SessionManager:
 
                 db.flush()
                 db.refresh(interview)
-
-                updated_session = SessionManager._model_to_session_dict(
-                    interview
-                )
+                updated_session = SessionManager._model_to_session_dict(interview)
                 active_sessions[session_id] = updated_session
 
                 return {
@@ -517,20 +504,11 @@ class SessionManager:
                     "ai_evaluation_successful": None,
                 }
 
-            # Persist the next predefined question.
-            SessionManager._store_question_record(
-                db=db,
-                interview=interview,
-                question=next_question,
-                stage=next_stage,
-            )
+            SessionManager._activate_question(interview, next_question)
 
             db.flush()
             db.refresh(interview)
-
-            updated_session = SessionManager._model_to_session_dict(
-                interview
-            )
+            updated_session = SessionManager._model_to_session_dict(interview)
             active_sessions[session_id] = updated_session
 
             return {
@@ -540,7 +518,7 @@ class SessionManager:
                 "evaluation": None,
                 "decision": None,
                 "next_action": "NEXT_QUESTION",
-                "next_question": next_question,
+                "next_question": SessionManager._question_record_to_dict(next_question),
                 "current_stage": interview.current_stage,
                 "evaluation_status": interview.evaluation_status,
                 "answer_classification": None,

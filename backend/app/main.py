@@ -12,7 +12,9 @@ from sqlalchemy.orm import Session
 
 from app.db.session import engine, get_db
 from app.db.models import Recruiter
-
+from app.services.interview_preparation_service import (
+    InterviewPreparationService,
+)
 from app.auth.security import (
     verify_password,
     create_access_token,
@@ -212,8 +214,16 @@ def get_logged_in_recruiter(
 )
 def create_interview(
     session_data: InterviewSessionCreate,
+    background_tasks: BackgroundTasks,
 ):
     session = SessionManager.create_session(session_data)
+
+    # Prepare the fixed question set without making the candidate wait
+    # for OpenRouter inside this HTTP request.
+    background_tasks.add_task(
+        InterviewPreparationService.run,
+        session["session_id"],
+    )
 
     return {
         "session_id": session["session_id"],
@@ -245,10 +255,29 @@ def get_interview(session_id: str):
 # START INTERVIEW
 # --------------------------------------------------
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
 @app.post("/interviews/{session_id}/start")
 def start_interview(session_id: str):
     try:
         session = SessionManager.start_session(session_id)
+
+        if session is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Interview session not found",
+            )
+
+        return {
+            "message": "Interview started successfully",
+            "session_id": session["session_id"],
+            "status": session["status"],
+            "current_stage": session["current_stage"],
+            "first_question": session["current_question"],
+        }
 
     except ValueError as error:
         raise HTTPException(
@@ -256,20 +285,17 @@ def start_interview(session_id: str):
             detail=str(error),
         )
 
-    if session is None:
+    except Exception:
+        logger.exception(
+            "Unexpected error while starting interview: %s",
+            session_id,
+        )
         raise HTTPException(
-            status_code=404,
-            detail="Interview session not found",
+            status_code=500,
+            detail="Internal error while starting interview. Check backend logs.",
         )
 
-    return {
-        "message": "Interview started successfully",
-        "session_id": session["session_id"],
-        "status": session["status"],
-        "current_stage": session["current_stage"],
-        "first_question": session["current_question"],
-    }
-
+  
 
 # --------------------------------------------------
 # SUBMIT CANDIDATE ANSWER
