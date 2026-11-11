@@ -13,3 +13,4 @@ pytest>=8.0.0
 pytest-asyncio>=0.24.0
 pwdlib[argon2]
 PyJWT
+json-repair==0.64.4
