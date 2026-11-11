@@ -343,7 +343,8 @@ class InterviewPreparationService:
                         asked_at=None,
 
                         metadata_snapshot={
-                            "source": "openrouter_staged_generation",
+                            "source": "gemini_staged_generation",
+
                             "generation_strategy": (
                                 "pre_generated_staged_branching"
                             ),
@@ -377,7 +378,7 @@ class InterviewPreparationService:
                     "jd_analysis": jd_analysis,
                     "question_count": len(questions),
                     "stage_sequence": cls.EXPECTED_STAGES,
-                    "generation_source": "openrouter",
+                    "generation_source": "gemini",
                     "question_generation_strategy": (
                         "pre_generated_staged_branching"
                     ),

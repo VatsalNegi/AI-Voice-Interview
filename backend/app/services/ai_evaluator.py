@@ -122,7 +122,7 @@ class AIEvaluator:
     ) -> AIEvaluation:
 
         # Check explicit no-knowledge responses first.
-        # No unnecessary OpenRouter request is made.
+        # No unnecessary Gemini API request is made.
         if self.detect_no_knowledge(candidate_answer):
 
             print(

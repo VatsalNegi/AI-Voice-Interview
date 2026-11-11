@@ -2,11 +2,9 @@
 import os
 import asyncio
 import logging
-import json
 import httpx
 
 from dotenv import load_dotenv
-
 
 # ============================================================
 # ENVIRONMENT CONFIGURATION
@@ -16,24 +14,21 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-OPENROUTER_BASE_URL = os.getenv(
-    "OPENROUTER_BASE_URL",
-    "https://openrouter.ai/api/v1",
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.8-flash"
 )
 
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL")
-
-OPENROUTER_TIMEOUT = float(
-    os.getenv("OPENROUTER_TIMEOUT", "120")
+GEMINI_TIMEOUT = float(
+    os.getenv("GEMINI_TIMEOUT", "120")
 )
 
 MAX_RETRIES = 3
 
 RETRYABLE_STATUS_CODES = {
     408,
-    429,
     500,
     502,
     503,
@@ -42,18 +37,18 @@ RETRYABLE_STATUS_CODES = {
 
 
 # ============================================================
-# OPENROUTER CLIENT
+# GEMINI CLIENT
 # ============================================================
 
-class OpenRouterClient:
+class GeminiClient:
     """
-    Reusable asynchronous OpenRouter client.
+    Reusable asynchronous Gemini API client.
 
     Supports:
     - Resume analysis
     - Job description analysis
     - Interview question generation
-    - Answer evaluation
+    - Candidate answer evaluation
     - JSON responses
     - Automatic retries
     - Provider error handling
@@ -61,32 +56,30 @@ class OpenRouterClient:
 
     def __init__(self):
 
-        if not OPENROUTER_API_KEY:
+        if not GEMINI_API_KEY:
             raise ValueError(
-                "OPENROUTER_API_KEY is missing in .env"
+                "GEMINI_API_KEY is missing in backend/.env"
             )
 
-        if not OPENROUTER_MODEL:
+        if not GEMINI_MODEL:
             raise ValueError(
-                "OPENROUTER_MODEL is missing in .env"
+                "GEMINI_MODEL is missing in backend/.env"
             )
 
-        self.model = OPENROUTER_MODEL
+        self.model = GEMINI_MODEL
 
         self.url = (
-            f"{OPENROUTER_BASE_URL.rstrip('/')}"
-            "/chat/completions"
+            "https://generativelanguage.googleapis.com/"
+            f"v1beta/models/{self.model}:generateContent"
         )
 
         self.headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "x-goog-api-key": GEMINI_API_KEY,
             "Content-Type": "application/json",
-            "HTTP-Referer": "http://localhost:5173",
-            "X-Title": "AI Voice Interview Platform",
         }
 
         self.timeout = httpx.Timeout(
-            OPENROUTER_TIMEOUT,
+            GEMINI_TIMEOUT,
             connect=15.0,
         )
 
@@ -95,61 +88,63 @@ class OpenRouterClient:
     # ========================================================
 
     @staticmethod
-    def _extract_content(message: dict) -> str:
+    def _extract_content(result: dict) -> str:
         """
-        Extract usable text from OpenRouter message content.
-
-        Supports:
-        1. Normal string content.
-        2. List-based text content.
+        Extract text from Gemini response candidates.
         """
 
-        content = message.get("content")
+        candidates = result.get("candidates", [])
 
-        if isinstance(content, str):
-            return content.strip()
+        if not isinstance(candidates, list) or not candidates:
+            return ""
 
-        if isinstance(content, list):
+        candidate = candidates[0]
 
-            text_parts = []
+        if not isinstance(candidate, dict):
+            return ""
 
-            for item in content:
+        content = candidate.get("content", {})
 
-                if isinstance(item, str):
-                    text_parts.append(item)
+        if not isinstance(content, dict):
+            return ""
 
-                elif isinstance(item, dict):
+        parts = content.get("parts", [])
 
-                    if item.get("type") == "text":
-                        text_value = item.get("text")
+        if not isinstance(parts, list):
+            return ""
 
-                        if isinstance(text_value, str):
-                            text_parts.append(text_value)
+        text_parts = []
 
-            return "".join(text_parts).strip()
+        for part in parts:
 
-        return ""
+            if not isinstance(part, dict):
+                continue
+
+            text_value = part.get("text")
+
+            if isinstance(text_value, str):
+                text_parts.append(text_value)
+
+        return "".join(text_parts).strip()
 
     # ========================================================
-    # PROVIDER ERROR EXTRACTION
+    # ERROR EXTRACTION
     # ========================================================
 
     @staticmethod
-    def _extract_provider_error(result: dict) -> str | None:
+    def _extract_error(result: dict) -> str:
 
-        error = result.get("error")
+        error = result.get("error", {})
 
         if isinstance(error, dict):
+
             return str(
                 error.get("message")
-                or error.get("code")
+                or error.get("status")
                 or error
             )
 
-        if error:
-            return str(error)
-
-        return None
+        return str(error or "Unknown Gemini API error")
 
     # ========================================================
     # GENERATE RESPONSE
@@ -164,49 +159,91 @@ class OpenRouterClient:
         response_format: dict | None = None,
     ) -> str:
 
+        # ----------------------------------------------------
+        # INPUT VALIDATION
+        # ----------------------------------------------------
+
         if not isinstance(system_prompt, str) or not system_prompt.strip():
-            raise ValueError("System prompt cannot be empty.")
+            raise ValueError(
+                "System prompt cannot be empty."
+            )
 
         if not isinstance(user_prompt, str) or not user_prompt.strip():
-            raise ValueError("User prompt cannot be empty.")
+            raise ValueError(
+                "User prompt cannot be empty."
+            )
 
         if max_tokens < 1:
-            raise ValueError("max_tokens must be greater than zero.")
+            raise ValueError(
+                "max_tokens must be greater than zero."
+            )
 
         if not 0 <= temperature <= 2:
-            raise ValueError("temperature must be between 0 and 2.")
+            raise ValueError(
+                "temperature must be between 0 and 2."
+            )
 
-        payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                },
-            ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
+        # ----------------------------------------------------
+        # GEMINI REQUEST PAYLOAD
+        # ----------------------------------------------------
+
+        generation_config = {
+            "maxOutputTokens": max_tokens,
         }
 
+        # Gemini 3.x uses its own sampling behavior.
+        # Temperature is intentionally not sent.
+
         if response_format is not None:
-            payload["response_format"] = response_format
+
+            if response_format.get("type") == "json_object":
+
+                generation_config["responseMimeType"] = (
+                    "application/json"
+                )
+
+        payload = {
+            "systemInstruction": {
+                "parts": [
+                    {
+                        "text": system_prompt
+                    }
+                ]
+            },
+
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": user_prompt
+                        }
+                    ]
+                }
+            ],
+
+            "generationConfig": generation_config,
+        }
 
         last_error = None
+
+        # ====================================================
+        # HTTP CLIENT
+        # ====================================================
 
         async with httpx.AsyncClient(
             timeout=self.timeout
         ) as client:
 
-            for attempt in range(1, MAX_RETRIES + 1):
+            for attempt in range(
+                1,
+                MAX_RETRIES + 1
+            ):
 
                 try:
 
                     logger.info(
-                        "OpenRouter request: model=%s attempt=%s/%s",
+                        "Gemini request: model=%s attempt=%s/%s",
                         self.model,
                         attempt,
                         MAX_RETRIES,
@@ -219,40 +256,57 @@ class OpenRouterClient:
                     )
 
                     # ----------------------------------------
-                    # HTTP ERROR HANDLING
+                    # RATE LIMIT HANDLING
+                    # ----------------------------------------
+
+                    if response.status_code == 429:
+
+                        raise RuntimeError(
+                            "Gemini API rate limit or quota exceeded. "
+                            "Check your Google AI Studio usage and quota."
+                        )
+
+                    # ----------------------------------------
+                    # RETRYABLE HTTP ERRORS
                     # ----------------------------------------
 
                     if response.status_code in RETRYABLE_STATUS_CODES:
 
-                        error_message = (
-                            f"OpenRouter HTTP {response.status_code}: "
+                        last_error = RuntimeError(
+                            f"Gemini HTTP {response.status_code}: "
                             f"{response.text[:1000]}"
                         )
 
-                        last_error = RuntimeError(error_message)
-
-                        logger.warning("%s", error_message)
+                        logger.warning(
+                            "%s",
+                            last_error
+                        )
 
                         if attempt < MAX_RETRIES:
 
                             delay = 2 ** attempt
 
                             logger.info(
-                                "Retrying OpenRouter in %s seconds.",
+                                "Retrying Gemini in %s seconds.",
                                 delay,
                             )
 
                             await asyncio.sleep(delay)
+
                             continue
 
                         break
 
+                    # ----------------------------------------
+                    # OTHER HTTP ERRORS
+                    # ----------------------------------------
+
                     if response.is_error:
 
                         raise RuntimeError(
-                            f"OpenRouter HTTP error "
+                            f"Gemini HTTP error "
                             f"{response.status_code}: "
-                            f"{response.text[:1000]}"
+                            f"{response.text[:1500]}"
                         )
 
                     # ----------------------------------------
@@ -260,132 +314,106 @@ class OpenRouterClient:
                     # ----------------------------------------
 
                     try:
+
                         result = response.json()
 
                     except ValueError as error:
 
                         raise RuntimeError(
-                            "OpenRouter returned invalid response JSON."
+                            "Gemini returned invalid response JSON."
                         ) from error
 
                     if not isinstance(result, dict):
 
                         raise RuntimeError(
-                            "Invalid OpenRouter response structure."
+                            "Invalid Gemini response structure."
                         )
 
                     # ----------------------------------------
                     # PROVIDER ERROR VALIDATION
                     # ----------------------------------------
 
-                    provider_error = self._extract_provider_error(
+                    provider_error = self._extract_error(
                         result
                     )
 
-                    if provider_error:
-
-                        error_message = (
-                            f"OpenRouter provider error: {provider_error}"
-                        )
-
-                        last_error = RuntimeError(error_message)
-
-                        logger.warning("%s", error_message)
-
-                        if attempt < MAX_RETRIES:
-
-                            await asyncio.sleep(2 ** attempt)
-                            continue
-
-                        break
-
-                    # ----------------------------------------
-                    # CHOICES VALIDATION
-                    # ----------------------------------------
-
-                    choices = result.get("choices")
-
-                    if not isinstance(choices, list) or not choices:
-
-                        error_message = (
-                            "OpenRouter returned no choices. "
-                            f"Model={result.get('model')}, "
-                            f"ResponseKeys={list(result.keys())}"
-                        )
-
-                        last_error = RuntimeError(error_message)
-
-                        logger.warning("%s", error_message)
-
-                        if attempt < MAX_RETRIES:
-
-                            await asyncio.sleep(2 ** attempt)
-                            continue
-
-                        break
-
-                    choice = choices[0]
-
-                    if not isinstance(choice, dict):
+                    if result.get("error"):
 
                         raise RuntimeError(
-                            "Invalid choice structure from OpenRouter."
-                        )
-
-                    message = choice.get("message", {})
-
-                    if not isinstance(message, dict):
-
-                        raise RuntimeError(
-                            "Invalid message structure from OpenRouter."
+                            f"Gemini provider error: {provider_error}"
                         )
 
                     # ----------------------------------------
                     # CONTENT EXTRACTION
                     # ----------------------------------------
 
-                    content = self._extract_content(message)
+                    content = self._extract_content(
+                        result
+                    )
 
-                    finish_reason = choice.get("finish_reason")
+                    candidates = result.get(
+                        "candidates",
+                        []
+                    )
+
+                    finish_reason = None
+
+                    if candidates and isinstance(candidates[0], dict):
+
+                        finish_reason = candidates[0].get(
+                            "finishReason"
+                        )
+
+                    # ----------------------------------------
+                    # EMPTY RESPONSE HANDLING
+                    # ----------------------------------------
 
                     if not content:
 
-                        error_message = (
-                            "OpenRouter returned no usable content. "
-                            f"Model={result.get('model')}, "
-                            f"FinishReason={finish_reason}, "
-                            f"MessageKeys={list(message.keys())}, "
-                            f"ResponseKeys={list(result.keys())}"
+                        prompt_feedback = result.get(
+                            "promptFeedback",
+                            {}
                         )
 
-                        last_error = RuntimeError(error_message)
+                        block_reason = (
+                            prompt_feedback.get("blockReason")
+                            if isinstance(prompt_feedback, dict)
+                            else None
+                        )
 
-                        logger.warning("%s", error_message)
-
-                        if attempt < MAX_RETRIES:
-
-                            delay = 2 ** attempt
-
-                            logger.info(
-                                "Empty response. Retrying in %s seconds.",
-                                delay,
-                            )
-
-                            await asyncio.sleep(delay)
-                            continue
-
-                        break
+                        raise RuntimeError(
+                            "Gemini returned no usable content. "
+                            f"Model={self.model}, "
+                            f"FinishReason={finish_reason}, "
+                            f"BlockReason={block_reason}"
+                        )
 
                     # ----------------------------------------
                     # TOKEN LIMIT VALIDATION
                     # ----------------------------------------
 
-                    if finish_reason == "length":
+                    if finish_reason == "MAX_TOKENS":
 
                         raise RuntimeError(
-                            "OpenRouter response was truncated because "
+                            "Gemini response was truncated because "
                             "the token limit was reached. "
                             "Increase max_tokens."
+                        )
+
+                    # ----------------------------------------
+                    # BLOCKED RESPONSE VALIDATION
+                    # ----------------------------------------
+
+                    if finish_reason in {
+                        "SAFETY",
+                        "RECITATION",
+                        "BLOCKLIST",
+                        "PROHIBITED_CONTENT",
+                    }:
+
+                        raise RuntimeError(
+                            "Gemini blocked the response. "
+                            f"FinishReason={finish_reason}"
                         )
 
                     # ----------------------------------------
@@ -393,9 +421,9 @@ class OpenRouterClient:
                     # ----------------------------------------
 
                     logger.info(
-                        "OpenRouter request successful. "
+                        "Gemini request successful. "
                         "Model=%s FinishReason=%s",
-                        result.get("model", self.model),
+                        self.model,
                         finish_reason,
                     )
 
@@ -410,7 +438,7 @@ class OpenRouterClient:
                     last_error = error
 
                     logger.warning(
-                        "OpenRouter timeout on attempt %s/%s.",
+                        "Gemini timeout on attempt %s/%s.",
                         attempt,
                         MAX_RETRIES,
                     )
@@ -418,6 +446,7 @@ class OpenRouterClient:
                     if attempt < MAX_RETRIES:
 
                         await asyncio.sleep(2 ** attempt)
+
                         continue
 
                 # --------------------------------------------
@@ -429,7 +458,7 @@ class OpenRouterClient:
                     last_error = error
 
                     logger.warning(
-                        "OpenRouter network error on attempt %s/%s: %s",
+                        "Gemini network error on attempt %s/%s: %s",
                         attempt,
                         MAX_RETRIES,
                         error,
@@ -438,11 +467,8 @@ class OpenRouterClient:
                     if attempt < MAX_RETRIES:
 
                         await asyncio.sleep(2 ** attempt)
-                        continue
 
-                # --------------------------------------------
-                # OTHER RUNTIME ERRORS
-                # --------------------------------------------
+                        continue
 
                 except RuntimeError:
                     raise
@@ -454,27 +480,27 @@ class OpenRouterClient:
         if isinstance(last_error, httpx.TimeoutException):
 
             raise RuntimeError(
-                f"OpenRouter request timed out after "
+                f"Gemini request timed out after "
                 f"{MAX_RETRIES} attempts. "
-                f"Configured timeout: {OPENROUTER_TIMEOUT} seconds."
+                f"Configured timeout: {GEMINI_TIMEOUT} seconds."
             ) from last_error
 
         if isinstance(last_error, httpx.RequestError):
 
             raise RuntimeError(
-                f"Could not connect to OpenRouter after "
+                f"Could not connect to Gemini after "
                 f"{MAX_RETRIES} attempts: {last_error}"
             ) from last_error
 
         if last_error:
 
             raise RuntimeError(
-                f"OpenRouter request failed after "
+                f"Gemini request failed after "
                 f"{MAX_RETRIES} attempts: {last_error}"
             ) from last_error
 
         raise RuntimeError(
-            "OpenRouter request failed unexpectedly."
+            "Gemini request failed unexpectedly."
         )
 
     # ========================================================
@@ -498,3 +524,11 @@ class OpenRouterClient:
                 "type": "json_object",
             },
         )
+
+
+# ============================================================
+# BACKWARD COMPATIBILITY
+# ============================================================
+
+# Existing services can continue importing OpenRouterClient.
+OpenRouterClient = GeminiClient

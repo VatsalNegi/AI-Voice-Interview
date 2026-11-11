@@ -30,11 +30,10 @@ class ResumeAnalyzer:
         job_description: str,
     ) -> dict[str, Any]:
 
+        # Only reject a genuinely missing resume.
+        # Short resumes are still sent for analysis.
         if not isinstance(resume_text, str) or not resume_text.strip():
             raise ValueError("Candidate resume is missing.")
-
-        if len(resume_text.strip()) < 30:
-            raise ValueError("Resume does not contain enough information.")
 
         system_prompt = """
 You are an expert technical recruiter and resume analyst.
@@ -51,6 +50,8 @@ CANDIDATE CLASSIFICATION:
    - No substantial full-time professional employment is evident.
    - May have academic projects, personal projects, or internships.
    - Internships alone do not automatically make someone experienced.
+   - Use this classification when the available resume evidence
+     reasonably supports a fresher profile.
 
 2. experienced:
    - The resume provides evidence of professional employment
@@ -58,8 +59,11 @@ CANDIDATE CLASSIFICATION:
    - Identify the actual roles, companies, responsibilities,
      and durations where available.
 
-3. If evidence is insufficient, use "uncertain".
-   Never invent employment history or assume experience.
+3. uncertain:
+   - Use this when the available information is insufficient
+     to reliably determine the candidate's background.
+   - Do not assume that missing employment information means
+     the candidate is a fresher.
 
 IMPORTANT RULES:
 
@@ -73,6 +77,22 @@ IMPORTANT RULES:
 - Do not invent company names, dates, job titles, or achievements.
 - Do not evaluate the candidate's answers; there are no answers yet.
 - Return only valid JSON.
+
+INSUFFICIENT RESUME INFORMATION:
+
+- A short resume is not automatically invalid.
+- Analyze whatever information is available, even if the resume
+  contains only a few words or sentences.
+- If the supplied information is insufficient to determine
+  employment history, classify the candidate as "uncertain".
+- Use low classification confidence when evidence is insufficient.
+- Do not assume the candidate is a fresher simply because
+  professional experience is not mentioned.
+- Do not invent projects, internships, employment, or skills.
+- Empty sections must remain empty when no evidence is available.
+- If the resume only mentions a technical skill or job title
+  without supporting employment evidence, do not infer
+  professional experience from that information alone.
 
 REQUIRED JSON STRUCTURE:
 
@@ -155,6 +175,9 @@ for generating a personalized interview.
 Determine whether the candidate is a fresher or experienced
 based on the resume evidence, not the job description.
 
+If the resume contains insufficient information, classify
+the candidate as uncertain instead of inventing details.
+
 Return only the JSON object.
 """
 
@@ -173,7 +196,9 @@ Return only the JSON object.
     def _parse_response(response: str) -> dict:
 
         if not response or not response.strip():
-            raise ValueError("Resume analyzer returned an empty response.")
+            raise ValueError(
+                "Resume analyzer returned an empty response."
+            )
 
         cleaned = response.strip()
 
@@ -189,10 +214,15 @@ Return only the JSON object.
         try:
             result = json.loads(cleaned)
         except json.JSONDecodeError:
-            result = repair_json(cleaned, return_objects=True)
+            result = repair_json(
+                cleaned,
+                return_objects=True,
+            )
 
         if not isinstance(result, dict):
-            raise ValueError("Resume analyzer returned invalid JSON.")
+            raise ValueError(
+                "Resume analyzer returned invalid JSON."
+            )
 
         return result
 
@@ -234,7 +264,10 @@ Return only the JSON object.
         if confidence not in {"high", "medium", "low"}:
             confidence = "low"
 
-        background = data.get("interview_personalization", {})
+        background = data.get(
+            "interview_personalization",
+            {},
+        )
 
         if not isinstance(background, dict):
             background = {}
@@ -255,10 +288,10 @@ Return only the JSON object.
         if candidate_type == "uncertain":
             background_focus = "clarification_required"
 
-        if candidate_type == "fresher":
+        elif candidate_type == "fresher":
             background_focus = "internships_and_projects"
 
-        if candidate_type == "experienced":
+        elif candidate_type == "experienced":
             background_focus = "professional_experience"
 
         total_experience = data.get(

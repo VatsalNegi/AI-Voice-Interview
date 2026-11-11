@@ -10,7 +10,7 @@ from app.services.openrouter_client import OpenRouterClient
 
 class JDAnalyzer:
     """
-    Analyzes a job description using OpenRouter.
+    Analyzes a job description using Google's Gemini API.
 
     Extracts:
     - Job title and seniority
