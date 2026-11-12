@@ -108,8 +108,46 @@ RULES:
   and clarify evidence.
 - Never treat internships or academic projects as full-time
   professional experience.
+
+COMPETENCY GROUNDING RULES:
+
+1. Every technical competency must directly represent a skill,
+   responsibility, tool, or requirement explicitly mentioned
+   in the JOB DESCRIPTION or EXTRACTED JOB REQUIREMENTS.
+
+2. Prefer competency labels that reuse the terminology from
+   the JD.
+
+3. You may use concise paraphrases only when their meaning is
+   directly supported by the JD.
+
+4. Never invent additional competencies based on assumptions
+   about the job title or industry.
+
+5. Do not introduce skills such as data cleaning, data validation,
+   Python, statistics, machine learning, or programming unless
+   the JD explicitly requires them.
+
+6. The technical question itself must assess the competency
+   specified in its competency field.
+
+7. Distribute the four technical questions across different
+   JD requirements whenever sufficient distinct requirements
+   are available.
+
+8. Do not use a generic competency label when a more precise
+   JD-grounded label is available.
+
+9. Resume evidence may personalize the question, but it must
+   not introduce a new job requirement absent from the JD.
+
+10. If a requirement is ambiguous, prefer a competency label
+    that uses the exact wording from the JD.
+
+ADDITIONAL RULES:
+
 - Technical questions must be grounded in the JD.
-- Do not invent technologies.
+- Do not invent technologies or tools.
 - Avoid duplicates and avoid asking the same thing in different wording.
 - Do not include model answers, scoring or explanations.
 - Return ONLY valid JSON.
@@ -156,9 +194,30 @@ and stage distribution.
 The two candidate_background questions must follow
 SELECTED CANDIDATE BRANCH.
 
-For technical questions, combine relevant resume evidence with
-the job requirements without penalizing the candidate for skills
-not stated in the resume.
+TECHNICAL QUESTION REQUIREMENTS:
+
+Generate all four technical questions using the actual
+JOB DESCRIPTION and EXTRACTED JOB REQUIREMENTS.
+
+Every technical competency must be directly traceable to
+a requirement in the provided JD.
+
+Prefer the original terminology used in the JD.
+
+Do not infer additional skills merely because they are
+commonly associated with the job title.
+
+Do not introduce technologies, tools, or competencies
+that are absent from the JD.
+
+The question wording must assess the competency assigned
+to that question.
+
+Use relevant resume evidence only for personalization.
+Do not introduce requirements absent from the JD.
+
+Distribute the four questions across different JD requirements
+where possible.
 
 Return only the JSON object.
 """

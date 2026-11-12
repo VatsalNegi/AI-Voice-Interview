@@ -244,12 +244,22 @@ class QuestionQualityValidator:
                     f"Technical question {index} has invalid text."
                 )
 
-            words = cls._tokenize(text)
+            # Count actual words, including common words
+            # and repeated words.
+            #
+            # Do not use _tokenize() here because it removes
+            # stop words and duplicate tokens.
+
+            words = re.findall(
+                r"\b[\w+#.]+\b",
+                text,
+            )
 
             if len(words) < cls.MIN_QUESTION_WORDS:
                 raise ValueError(
                     f"Technical question {index} is too short "
-                    "to assess technical knowledge properly."
+                    f"({len(words)} words; minimum is "
+                    f"{cls.MIN_QUESTION_WORDS})."
                 )
 
             competency = question.get("competency")
