@@ -2,9 +2,10 @@
 import os
 import asyncio
 import logging
-import httpx
 
+import httpx
 from dotenv import load_dotenv
+
 
 # ============================================================
 # ENVIRONMENT CONFIGURATION
@@ -18,14 +19,34 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-3.8-flash"
+    "gemini-3.8-flash",
 )
+
+DEFAULT_FALLBACK_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+]
+
+GEMINI_FALLBACK_MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "GEMINI_FALLBACK_MODELS",
+        ",".join(DEFAULT_FALLBACK_MODELS),
+    ).split(",")
+    if model.strip()
+]
 
 GEMINI_TIMEOUT = float(
     os.getenv("GEMINI_TIMEOUT", "120")
 )
 
-MAX_RETRIES = 3
+# Total attempts per model, including the first request.
+GEMINI_ATTEMPTS_PER_MODEL = int(
+    os.getenv("GEMINI_ATTEMPTS_PER_MODEL", "2")
+)
+
+INITIAL_RETRY_DELAY = 0.5
 
 RETRYABLE_STATUS_CODES = {
     408,
@@ -35,6 +56,11 @@ RETRYABLE_STATUS_CODES = {
     504,
 }
 
+API_BASE_URL = (
+    "https://generativelanguage.googleapis.com/"
+    "v1beta/models"
+)
+
 
 # ============================================================
 # GEMINI CLIENT
@@ -42,16 +68,15 @@ RETRYABLE_STATUS_CODES = {
 
 class GeminiClient:
     """
-    Reusable asynchronous Gemini API client.
+    Asynchronous Gemini client with automatic model fallback.
 
-    Supports:
-    - Resume analysis
-    - Job description analysis
-    - Interview question generation
-    - Candidate answer evaluation
-    - JSON responses
-    - Automatic retries
-    - Provider error handling
+    Features:
+    - Multiple Gemini model support
+    - Automatic model switching
+    - Exponential retry backoff
+    - HTTP error handling
+    - JSON response support
+    - Existing service interface preserved
     """
 
     def __init__(self):
@@ -66,11 +91,16 @@ class GeminiClient:
                 "GEMINI_MODEL is missing in backend/.env"
             )
 
-        self.model = GEMINI_MODEL
+        if GEMINI_ATTEMPTS_PER_MODEL < 1:
+            raise ValueError(
+                "GEMINI_ATTEMPTS_PER_MODEL must be at least 1."
+            )
 
-        self.url = (
-            "https://generativelanguage.googleapis.com/"
-            f"v1beta/models/{self.model}:generateContent"
+        # Primary model always gets first priority.
+        self.models = list(
+            dict.fromkeys(
+                [GEMINI_MODEL] + GEMINI_FALLBACK_MODELS
+            )
         )
 
         self.headers = {
@@ -83,15 +113,17 @@ class GeminiClient:
             connect=15.0,
         )
 
+        logger.info(
+            "Gemini client initialized. Models=%s",
+            self.models,
+        )
+
     # ========================================================
-    # RESPONSE CONTENT EXTRACTION
+    # RESPONSE EXTRACTION
     # ========================================================
 
     @staticmethod
     def _extract_content(result: dict) -> str:
-        """
-        Extract text from Gemini response candidates.
-        """
 
         candidates = result.get("candidates", [])
 
@@ -127,10 +159,6 @@ class GeminiClient:
 
         return "".join(text_parts).strip()
 
-    # ========================================================
-    # ERROR EXTRACTION
-    # ========================================================
-
     @staticmethod
     def _extract_error(result: dict) -> str:
 
@@ -147,7 +175,229 @@ class GeminiClient:
         return str(error or "Unknown Gemini API error")
 
     # ========================================================
-    # GENERATE RESPONSE
+    # REQUEST ONE MODEL
+    # ========================================================
+
+    async def _request_model(
+        self,
+        client: httpx.AsyncClient,
+        model: str,
+        payload: dict,
+    ) -> str:
+
+        url = f"{API_BASE_URL}/{model}:generateContent"
+
+        last_error = None
+
+        for attempt in range(
+            1,
+            GEMINI_ATTEMPTS_PER_MODEL + 1,
+        ):
+
+            try:
+
+                logger.info(
+                    "Gemini request: model=%s attempt=%s/%s",
+                    model,
+                    attempt,
+                    GEMINI_ATTEMPTS_PER_MODEL,
+                )
+
+                response = await client.post(
+                    url,
+                    headers=self.headers,
+                    json=payload,
+                )
+
+                status = response.status_code
+
+                # ------------------------------------------------
+                # RATE LIMIT / QUOTA
+                # ------------------------------------------------
+
+                if status == 429:
+
+                    raise RuntimeError(
+                        f"Gemini HTTP 429 for {model}: "
+                        f"{response.text[:1000]}"
+                    )
+
+                # ------------------------------------------------
+                # RETRYABLE SERVER ERRORS
+                # ------------------------------------------------
+
+                if status in RETRYABLE_STATUS_CODES:
+
+                    last_error = RuntimeError(
+                        f"Gemini HTTP {status} for {model}: "
+                        f"{response.text[:1000]}"
+                    )
+
+                    logger.warning("%s", last_error)
+
+                    if attempt < GEMINI_ATTEMPTS_PER_MODEL:
+
+                        delay = (
+                            INITIAL_RETRY_DELAY
+                            * (2 ** (attempt - 1))
+                        )
+
+                        logger.info(
+                            "Retrying %s in %.2f seconds",
+                            model,
+                            delay,
+                        )
+
+                        await asyncio.sleep(delay)
+                        continue
+
+                    raise last_error
+
+                # ------------------------------------------------
+                # NON-RETRYABLE HTTP ERRORS
+                # ------------------------------------------------
+
+                if response.is_error:
+
+                    raise RuntimeError(
+                        f"Gemini HTTP {status} for {model}: "
+                        f"{response.text[:1500]}"
+                    )
+
+                # ------------------------------------------------
+                # PARSE RESPONSE
+                # ------------------------------------------------
+
+                try:
+                    result = response.json()
+
+                except ValueError as error:
+
+                    raise RuntimeError(
+                        f"Gemini returned invalid response JSON "
+                        f"from {model}."
+                    ) from error
+
+                if not isinstance(result, dict):
+
+                    raise RuntimeError(
+                        f"Invalid Gemini response structure from {model}."
+                    )
+
+                if result.get("error"):
+
+                    raise RuntimeError(
+                        f"Gemini provider error for {model}: "
+                        f"{self._extract_error(result)}"
+                    )
+
+                content = self._extract_content(result)
+
+                candidates = result.get("candidates", [])
+
+                finish_reason = None
+
+                if candidates and isinstance(candidates[0], dict):
+
+                    finish_reason = candidates[0].get(
+                        "finishReason"
+                    )
+
+                # ------------------------------------------------
+                # EMPTY RESPONSE
+                # ------------------------------------------------
+
+                if not content:
+
+                    prompt_feedback = result.get(
+                        "promptFeedback",
+                        {},
+                    )
+
+                    block_reason = (
+                        prompt_feedback.get("blockReason")
+                        if isinstance(prompt_feedback, dict)
+                        else None
+                    )
+
+                    raise RuntimeError(
+                        f"Gemini returned no usable content. "
+                        f"Model={model}, "
+                        f"FinishReason={finish_reason}, "
+                        f"BlockReason={block_reason}"
+                    )
+
+                # ------------------------------------------------
+                # TOKEN LIMIT
+                # ------------------------------------------------
+
+                if finish_reason == "MAX_TOKENS":
+
+                    raise RuntimeError(
+                        f"Gemini response truncated by token limit. "
+                        f"Model={model}"
+                    )
+
+                # ------------------------------------------------
+                # SAFETY BLOCK
+                # ------------------------------------------------
+
+                if finish_reason in {
+                    "SAFETY",
+                    "RECITATION",
+                    "BLOCKLIST",
+                    "PROHIBITED_CONTENT",
+                }:
+
+                    raise RuntimeError(
+                        f"Gemini blocked the response. "
+                        f"Model={model}, "
+                        f"FinishReason={finish_reason}"
+                    )
+
+                logger.info(
+                    "Gemini request successful. Model=%s",
+                    model,
+                )
+
+                return content
+
+            except (
+                httpx.TimeoutException,
+                httpx.RequestError,
+            ) as error:
+
+                last_error = error
+
+                logger.warning(
+                    "Gemini connection error. Model=%s "
+                    "Attempt=%s Error=%s",
+                    model,
+                    attempt,
+                    error,
+                )
+
+                if attempt < GEMINI_ATTEMPTS_PER_MODEL:
+
+                    delay = (
+                        INITIAL_RETRY_DELAY
+                        * (2 ** (attempt - 1))
+                    )
+
+                    await asyncio.sleep(delay)
+                    continue
+
+                raise RuntimeError(
+                    f"Gemini request failed for model {model}: "
+                    f"{error}"
+                ) from error
+
+        raise RuntimeError(
+            f"Gemini model {model} failed: {last_error}"
+        )
+
+    # ========================================================
+    # GENERATE RESPONSE WITH MODEL FALLBACK
     # ========================================================
 
     async def generate_response(
@@ -163,12 +413,18 @@ class GeminiClient:
         # INPUT VALIDATION
         # ----------------------------------------------------
 
-        if not isinstance(system_prompt, str) or not system_prompt.strip():
+        if (
+            not isinstance(system_prompt, str)
+            or not system_prompt.strip()
+        ):
             raise ValueError(
                 "System prompt cannot be empty."
             )
 
-        if not isinstance(user_prompt, str) or not user_prompt.strip():
+        if (
+            not isinstance(user_prompt, str)
+            or not user_prompt.strip()
+        ):
             raise ValueError(
                 "User prompt cannot be empty."
             )
@@ -184,323 +440,112 @@ class GeminiClient:
             )
 
         # ----------------------------------------------------
-        # GEMINI REQUEST PAYLOAD
+        # REQUEST PAYLOAD
         # ----------------------------------------------------
 
         generation_config = {
             "maxOutputTokens": max_tokens,
         }
 
-        # Gemini 3.x uses its own sampling behavior.
-        # Temperature is intentionally not sent.
+        if (
+            response_format is not None
+            and response_format.get("type") == "json_object"
+        ):
 
-        if response_format is not None:
-
-            if response_format.get("type") == "json_object":
-
-                generation_config["responseMimeType"] = (
-                    "application/json"
-                )
+            generation_config["responseMimeType"] = (
+                "application/json"
+            )
 
         payload = {
             "systemInstruction": {
                 "parts": [
                     {
-                        "text": system_prompt
+                        "text": system_prompt,
                     }
-                ]
+                ],
             },
-
             "contents": [
                 {
                     "role": "user",
                     "parts": [
                         {
-                            "text": user_prompt
+                            "text": user_prompt,
                         }
-                    ]
+                    ],
                 }
             ],
-
             "generationConfig": generation_config,
         }
 
-        last_error = None
+        # ----------------------------------------------------
+        # TRY MODELS IN PRIORITY ORDER
+        # ----------------------------------------------------
 
-        # ====================================================
-        # HTTP CLIENT
-        # ====================================================
+        errors = []
 
         async with httpx.AsyncClient(
             timeout=self.timeout
         ) as client:
 
-            for attempt in range(
-                1,
-                MAX_RETRIES + 1
-            ):
+            for index, model in enumerate(self.models):
+
+                logger.info(
+                    "Trying Gemini model %s (%s/%s)",
+                    model,
+                    index + 1,
+                    len(self.models),
+                )
 
                 try:
 
-                    logger.info(
-                        "Gemini request: model=%s attempt=%s/%s",
-                        self.model,
-                        attempt,
-                        MAX_RETRIES,
+                    return await self._request_model(
+                        client=client,
+                        model=model,
+                        payload=payload,
                     )
 
-                    response = await client.post(
-                        self.url,
-                        headers=self.headers,
-                        json=payload,
+                except RuntimeError as error:
+
+                    error_message = str(error)
+
+                    errors.append(
+                        f"{model}: {error_message}"
                     )
 
-                    # ----------------------------------------
-                    # RATE LIMIT HANDLING
-                    # ----------------------------------------
-
-                    if response.status_code == 429:
-
-                        raise RuntimeError(
-                            "Gemini API rate limit or quota exceeded. "
-                            "Check your Google AI Studio usage and quota."
+                    # Do not switch models for authentication,
+                    # permission, malformed request or safety errors.
+                    if any(
+                        marker in error_message
+                        for marker in (
+                            "HTTP 400",
+                            "HTTP 401",
+                            "HTTP 403",
+                            "blocked the response",
+                            "token limit",
                         )
+                    ):
 
-                    # ----------------------------------------
-                    # RETRYABLE HTTP ERRORS
-                    # ----------------------------------------
-
-                    if response.status_code in RETRYABLE_STATUS_CODES:
-
-                        last_error = RuntimeError(
-                            f"Gemini HTTP {response.status_code}: "
-                            f"{response.text[:1000]}"
-                        )
-
-                        logger.warning(
-                            "%s",
-                            last_error
-                        )
-
-                        if attempt < MAX_RETRIES:
-
-                            delay = 2 ** attempt
-
-                            logger.info(
-                                "Retrying Gemini in %s seconds.",
-                                delay,
-                            )
-
-                            await asyncio.sleep(delay)
-
-                            continue
-
-                        break
-
-                    # ----------------------------------------
-                    # OTHER HTTP ERRORS
-                    # ----------------------------------------
-
-                    if response.is_error:
-
-                        raise RuntimeError(
-                            f"Gemini HTTP error "
-                            f"{response.status_code}: "
-                            f"{response.text[:1500]}"
-                        )
-
-                    # ----------------------------------------
-                    # RESPONSE JSON VALIDATION
-                    # ----------------------------------------
-
-                    try:
-
-                        result = response.json()
-
-                    except ValueError as error:
-
-                        raise RuntimeError(
-                            "Gemini returned invalid response JSON."
-                        ) from error
-
-                    if not isinstance(result, dict):
-
-                        raise RuntimeError(
-                            "Invalid Gemini response structure."
-                        )
-
-                    # ----------------------------------------
-                    # PROVIDER ERROR VALIDATION
-                    # ----------------------------------------
-
-                    provider_error = self._extract_error(
-                        result
-                    )
-
-                    if result.get("error"):
-
-                        raise RuntimeError(
-                            f"Gemini provider error: {provider_error}"
-                        )
-
-                    # ----------------------------------------
-                    # CONTENT EXTRACTION
-                    # ----------------------------------------
-
-                    content = self._extract_content(
-                        result
-                    )
-
-                    candidates = result.get(
-                        "candidates",
-                        []
-                    )
-
-                    finish_reason = None
-
-                    if candidates and isinstance(candidates[0], dict):
-
-                        finish_reason = candidates[0].get(
-                            "finishReason"
-                        )
-
-                    # ----------------------------------------
-                    # EMPTY RESPONSE HANDLING
-                    # ----------------------------------------
-
-                    if not content:
-
-                        prompt_feedback = result.get(
-                            "promptFeedback",
-                            {}
-                        )
-
-                        block_reason = (
-                            prompt_feedback.get("blockReason")
-                            if isinstance(prompt_feedback, dict)
-                            else None
-                        )
-
-                        raise RuntimeError(
-                            "Gemini returned no usable content. "
-                            f"Model={self.model}, "
-                            f"FinishReason={finish_reason}, "
-                            f"BlockReason={block_reason}"
-                        )
-
-                    # ----------------------------------------
-                    # TOKEN LIMIT VALIDATION
-                    # ----------------------------------------
-
-                    if finish_reason == "MAX_TOKENS":
-
-                        raise RuntimeError(
-                            "Gemini response was truncated because "
-                            "the token limit was reached. "
-                            "Increase max_tokens."
-                        )
-
-                    # ----------------------------------------
-                    # BLOCKED RESPONSE VALIDATION
-                    # ----------------------------------------
-
-                    if finish_reason in {
-                        "SAFETY",
-                        "RECITATION",
-                        "BLOCKLIST",
-                        "PROHIBITED_CONTENT",
-                    }:
-
-                        raise RuntimeError(
-                            "Gemini blocked the response. "
-                            f"FinishReason={finish_reason}"
-                        )
-
-                    # ----------------------------------------
-                    # SUCCESS
-                    # ----------------------------------------
-
-                    logger.info(
-                        "Gemini request successful. "
-                        "Model=%s FinishReason=%s",
-                        self.model,
-                        finish_reason,
-                    )
-
-                    return content
-
-                # --------------------------------------------
-                # TIMEOUT HANDLING
-                # --------------------------------------------
-
-                except httpx.TimeoutException as error:
-
-                    last_error = error
+                        raise
 
                     logger.warning(
-                        "Gemini timeout on attempt %s/%s.",
-                        attempt,
-                        MAX_RETRIES,
+                        "Gemini model failed. "
+                        "Switching from %s if another model exists. "
+                        "Reason=%s",
+                        model,
+                        error_message,
                     )
 
-                    if attempt < MAX_RETRIES:
+                    if index < len(self.models) - 1:
 
-                        await asyncio.sleep(2 ** attempt)
-
-                        continue
-
-                # --------------------------------------------
-                # NETWORK ERROR HANDLING
-                # --------------------------------------------
-
-                except httpx.RequestError as error:
-
-                    last_error = error
-
-                    logger.warning(
-                        "Gemini network error on attempt %s/%s: %s",
-                        attempt,
-                        MAX_RETRIES,
-                        error,
-                    )
-
-                    if attempt < MAX_RETRIES:
-
-                        await asyncio.sleep(2 ** attempt)
+                        logger.info(
+                            "Switching to next Gemini model."
+                        )
 
                         continue
-
-                except RuntimeError:
-                    raise
-
-        # ====================================================
-        # FINAL ERROR HANDLING
-        # ====================================================
-
-        if isinstance(last_error, httpx.TimeoutException):
-
-            raise RuntimeError(
-                f"Gemini request timed out after "
-                f"{MAX_RETRIES} attempts. "
-                f"Configured timeout: {GEMINI_TIMEOUT} seconds."
-            ) from last_error
-
-        if isinstance(last_error, httpx.RequestError):
-
-            raise RuntimeError(
-                f"Could not connect to Gemini after "
-                f"{MAX_RETRIES} attempts: {last_error}"
-            ) from last_error
-
-        if last_error:
-
-            raise RuntimeError(
-                f"Gemini request failed after "
-                f"{MAX_RETRIES} attempts: {last_error}"
-            ) from last_error
 
         raise RuntimeError(
-            "Gemini request failed unexpectedly."
+            "All configured Gemini models failed.\n"
+            + "\n".join(errors)
         )
 
     # ========================================================
@@ -530,5 +575,4 @@ class GeminiClient:
 # BACKWARD COMPATIBILITY
 # ============================================================
 
-# Existing services can continue importing OpenRouterClient.
 OpenRouterClient = GeminiClient

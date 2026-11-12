@@ -2,7 +2,7 @@
 import asyncio
 import json
 
-from app.services.openrouter_client import OpenRouterClient
+from app.services.ai_provider_manager import AIProviderManager as OpenRouterClient
 
 
 async def main():

@@ -4,8 +4,7 @@ import re
 from typing import Any
 
 from json_repair import repair_json
-
-from app.services.openrouter_client import OpenRouterClient
+from app.services.ai_provider_manager import AIProviderManager as OpenRouterClient
 
 
 class JDAnalyzer:
