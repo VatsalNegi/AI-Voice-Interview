@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 
 import {
@@ -14,6 +15,7 @@ import {
 } from "lucide-react";
 
 import {
+  startInterview,
   submitAnswer,
   getInterview,
   speakQuestion,
@@ -23,6 +25,7 @@ import {
 const DEEPGRAM_MODEL = "nova-3";
 const DEEPGRAM_LANGUAGE = "en-IN";
 const SILENCE_DURATION_MS = 4000;
+const SILENCE_THRESHOLD = 0.025;
 
 export default function LiveInterview() {
   const location = useLocation();
@@ -37,9 +40,9 @@ export default function LiveInterview() {
     sessionStorage.getItem("candidateName") ||
     "Candidate";
 
-  // =========================================
-  // REFERENCES
-  // =========================================
+  // --------------------------------------------------
+  // REFS
+  // --------------------------------------------------
 
   const videoRef = useRef(null);
   const streamRef = useRef(null);
@@ -47,97 +50,84 @@ export default function LiveInterview() {
   const audioRef = useRef(null);
   const audioUrlRef = useRef(null);
 
-  // Deepgram streaming references
   const deepgramSocketRef = useRef(null);
   const mediaRecorderRef = useRef(null);
-  const deepgramConnectingRef = useRef(false);
-  const deepgramReadyRef = useRef(false);
-  const finalizingRef = useRef(false);
-  const finalTranscriptPartsRef = useRef([]);
-  const interimTranscriptRef = useRef("");
-  const finalizeTimeoutRef = useRef(null);
 
-  const restartTimerRef = useRef(null);
-  const vadIntervalRef = useRef(null);
   const audioContextRef = useRef(null);
   const analyserRef = useRef(null);
+  const vadIntervalRef = useRef(null);
+
+  const finalTranscriptPartsRef = useRef([]);
+  const interimTranscriptRef = useRef("");
+  const transcriptRef = useRef("");
+
+  const listeningWantedRef = useRef(false);
+  const deepgramReadyRef = useRef(false);
+  const deepgramConnectingRef = useRef(false);
 
   const speechStartedRef = useRef(false);
   const silenceStartedAtRef = useRef(null);
-  const autoSubmitLockRef = useRef(false);
 
-  const listeningWantedRef = useRef(false);
-  const transcriptRef = useRef("");
-
-  const micEnabledRef = useRef(false);
   const submittingRef = useRef(false);
   const completedRef = useRef(false);
+  const initializationRef = useRef(false);
 
-  // Fullscreen proctoring refs
-  const interviewStartedRef = useRef(false);
+  const micEnabledRef = useRef(false);
   const pausedRef = useRef(false);
-  const violationCountRef = useRef(0);
-  const terminationRef = useRef(false);
-  const countdownTimerRef = useRef(null);
 
-  // =========================================
-  // CAMERA AND MICROPHONE STATES
-  // =========================================
+  const interviewStartedRef = useRef(false);
+  const terminationRef = useRef(false);
+  const violationCountRef = useRef(0);
+
+  const countdownTimerRef = useRef(null);
+  const silenceSubmitLockRef = useRef(false);
+
+  const questionRef = useRef("");
+  const mountedRef = useRef(true);
+
+  // --------------------------------------------------
+  // STATES
+  // --------------------------------------------------
 
   const [cameraEnabled, setCameraEnabled] = useState(false);
   const [micEnabled, setMicEnabled] = useState(false);
   const [permissionError, setPermissionError] = useState("");
 
-  // =========================================
-  // INTERVIEW STATES
-  // =========================================
-
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
 
-  const [stage, setStage] = useState("INTRO");
+  const [stage, setStage] = useState("Introduction");
   const [questionNumber, setQuestionNumber] = useState(1);
 
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
-
   const [error, setError] = useState("");
+
   const [completed, setCompleted] = useState(false);
+  const [terminated, setTerminated] = useState(false);
 
   const [secondsElapsed, setSecondsElapsed] = useState(0);
-
-  // =========================================
-  // FULLSCREEN PROCTORING STATES
-  // =========================================
 
   const [proctoringReady, setProctoringReady] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [fullscreenWarning, setFullscreenWarning] = useState(false);
   const [violationCount, setViolationCount] = useState(0);
   const [countdown, setCountdown] = useState(8);
-  const [terminated, setTerminated] = useState(false);
   const [proctoringMessage, setProctoringMessage] = useState("");
 
-  // =========================================
-  // AI VOICE STATES
-  // =========================================
-
   const [voiceStatus, setVoiceStatus] = useState("idle");
-
-  // idle | generating | speaking | ready | error
-
-  // =========================================
-  // DEEPGRAM SPEECH STATES
-  // =========================================
-
   const [isListening, setIsListening] = useState(false);
   const [speechSupported, setSpeechSupported] = useState(true);
   const [speechError, setSpeechError] = useState("");
   const [silenceCountdown, setSilenceCountdown] = useState(4);
 
-  // =========================================
-  // KEEP REFS SYNCHRONIZED
-  // =========================================
+  // --------------------------------------------------
+  // SYNCHRONIZE REFS
+  // --------------------------------------------------
+
+  useEffect(() => {
+    questionRef.current = question;
+  }, [question]);
 
   useEffect(() => {
     micEnabledRef.current = micEnabled;
@@ -159,37 +149,112 @@ export default function LiveInterview() {
     violationCountRef.current = violationCount;
   }, [violationCount]);
 
-  // =========================================
-  // STOP DEEPGRAM AND AUDIO CAPTURE
-  // =========================================
+  // --------------------------------------------------
+  // HELPERS
+  // --------------------------------------------------
 
-  const stopListening = () => {
+  const formatTime = (seconds) => {
+    const minutes = Math.floor(seconds / 60);
+    const remaining = seconds % 60;
+
+    return `${String(minutes).padStart(2, "0")}:${String(
+      remaining
+    ).padStart(2, "0")}`;
+  };
+
+  const extractQuestion = (data) => {
+    if (!data) return null;
+
+    if (typeof data === "string") {
+      return {
+        question: data,
+        sequence_number: 1,
+        stage: "introduction",
+      };
+    }
+
+    if (typeof data.current_question === "string") {
+      return {
+        question: data.current_question,
+        sequence_number: 1,
+        stage: data.current_stage,
+      };
+    }
+
+    if (data.current_question?.question) {
+      return data.current_question;
+    }
+
+    if (data.first_question?.question) {
+      return data.first_question;
+    }
+
+    if (data.next_question?.question) {
+      return data.next_question;
+    }
+
+    if (data.question?.question) {
+      return data.question;
+    }
+
+    if (typeof data.question === "string") {
+      return {
+        question: data.question,
+        sequence_number: data.sequence_number || 1,
+        stage: data.current_stage || data.stage,
+      };
+    }
+
+    return null;
+  };
+
+  const displayQuestion = (questionData) => {
+    if (!questionData?.question) {
+      throw new Error("The interview response did not contain a question.");
+    }
+
+    setQuestion(questionData.question);
+    questionRef.current = questionData.question;
+
+    setStage(
+      questionData.stage_label ||
+        questionData.stage ||
+        "Interview"
+    );
+
+    setQuestionNumber(
+      questionData.sequence_number || 1
+    );
+
+    setAnswer("");
+    transcriptRef.current = "";
+    finalTranscriptPartsRef.current = [];
+    interimTranscriptRef.current = "";
+    speechStartedRef.current = false;
+    silenceStartedAtRef.current = null;
+    silenceSubmitLockRef.current = false;
+    setSilenceCountdown(4);
+  };
+
+  // --------------------------------------------------
+  // STOP DEEPGRAM
+  // --------------------------------------------------
+
+  const stopListening = useCallback(() => {
     listeningWantedRef.current = false;
     deepgramReadyRef.current = false;
     deepgramConnectingRef.current = false;
-    finalizingRef.current = false;
-
-    if (restartTimerRef.current) {
-      clearTimeout(restartTimerRef.current);
-      restartTimerRef.current = null;
-    }
-
-    if (finalizeTimeoutRef.current) {
-      clearTimeout(finalizeTimeoutRef.current);
-      finalizeTimeoutRef.current = null;
-    }
 
     if (vadIntervalRef.current) {
       clearInterval(vadIntervalRef.current);
       vadIntervalRef.current = null;
     }
 
-    speechStartedRef.current = false;
-    silenceStartedAtRef.current = null;
-    autoSubmitLockRef.current = false;
-
-    setSilenceCountdown(4);
-    setIsListening(false);
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => {});
+      audioContextRef.current = null;
+      analyserRef.current = null;
+    }
 
     const recorder = mediaRecorderRef.current;
     mediaRecorderRef.current = null;
@@ -199,7 +264,7 @@ export default function LiveInterview() {
         recorder.ondataavailable = null;
         recorder.stop();
       } catch (err) {
-        console.warn("MediaRecorder stop:", err);
+        console.warn("Recorder stop error:", err);
       }
     }
 
@@ -208,106 +273,99 @@ export default function LiveInterview() {
 
     if (socket) {
       try {
-        if (socket.readyState === WebSocket.OPEN) {
-          socket.close(1000, "Interview listening stopped");
-        } else if (socket.readyState === WebSocket.CONNECTING) {
-          socket.close();
-        }
+        socket.close(1000, "Listening stopped");
       } catch (err) {
-        console.warn("Deepgram socket close:", err);
+        console.warn("Socket close error:", err);
       }
     }
-  };
 
-  // =========================================
-  // STOP ALL INTERVIEW ACTIVITY
-  // =========================================
+    setIsListening(false);
+    setSilenceCountdown(4);
 
-  const stopInterviewActivity = () => {
+    speechStartedRef.current = false;
+    silenceStartedAtRef.current = null;
+  }, []);
+
+  // --------------------------------------------------
+  // STOP ALL ACTIVITY
+  // --------------------------------------------------
+
+  const stopInterviewActivity = useCallback(() => {
     stopListening();
 
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current.currentTime = 0;
     }
+  }, [stopListening]);
 
-    if (vadIntervalRef.current) {
-      clearInterval(vadIntervalRef.current);
-      vadIntervalRef.current = null;
-    }
-
-    if (restartTimerRef.current) {
-      clearTimeout(restartTimerRef.current);
-      restartTimerRef.current = null;
-    }
-  };
-
-  // =========================================
+  // --------------------------------------------------
   // TERMINATE INTERVIEW
-  // =========================================
+  // --------------------------------------------------
 
-  const terminateInterview = async (reason) => {
-    if (terminationRef.current) return;
+  const terminateInterview = useCallback(
+    async (reason) => {
+      if (terminationRef.current) return;
 
-    terminationRef.current = true;
-    completedRef.current = true;
-    listeningWantedRef.current = false;
+      terminationRef.current = true;
+      completedRef.current = true;
 
-    stopInterviewActivity();
+      stopInterviewActivity();
 
-    if (countdownTimerRef.current) {
-      clearTimeout(countdownTimerRef.current);
-      countdownTimerRef.current = null;
-    }
+      if (countdownTimerRef.current) {
+        clearTimeout(countdownTimerRef.current);
+        countdownTimerRef.current = null;
+      }
 
-    setFullscreenWarning(false);
-    setIsPaused(false);
-    setTerminated(true);
-    setProctoringMessage(reason);
+      setFullscreenWarning(false);
+      setIsPaused(false);
+      setTerminated(true);
+      setProctoringMessage(reason);
 
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-    }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+      }
 
-    setCameraEnabled(false);
-    setMicEnabled(false);
+      setCameraEnabled(false);
+      setMicEnabled(false);
 
-    try {
-      const baseUrl =
-        import.meta.env.VITE_API_BASE_URL ||
-        "http://127.0.0.1:8000";
+      try {
+        const baseUrl =
+          import.meta.env.VITE_API_BASE_URL ||
+          "http://127.0.0.1:8000";
 
-      await fetch(
-        `${baseUrl}/interviews/${sessionId}/terminate`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            reason,
-            violation_count: violationCountRef.current,
-          }),
-        }
-      );
-    } catch (err) {
-      console.error("Interview termination request failed:", err);
-    }
-  };
+        await fetch(
+          `${baseUrl}/interviews/${sessionId}/terminate`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              reason,
+              violation_count: violationCountRef.current,
+            }),
+          }
+        );
+      } catch (err) {
+        console.error("Termination request failed:", err);
+      }
+    },
+    [sessionId, stopInterviewActivity]
+  );
 
-  // =========================================
-  // FULLSCREEN WARNING COUNTDOWN
-  // =========================================
+  // --------------------------------------------------
+  // FULLSCREEN COUNTDOWN
+  // --------------------------------------------------
 
   const startViolationCountdown = () => {
     if (countdownTimerRef.current) {
       clearTimeout(countdownTimerRef.current);
     }
 
-    setCountdown(8);
-
     let remaining = 8;
+    setCountdown(8);
 
     const tick = () => {
       remaining -= 1;
@@ -329,16 +387,14 @@ export default function LiveInterview() {
     countdownTimerRef.current = setTimeout(tick, 1000);
   };
 
-  // =========================================
+  // --------------------------------------------------
   // ENTER FULLSCREEN
-  // =========================================
+  // --------------------------------------------------
 
   const enterFullscreen = async () => {
     try {
-      const element = document.documentElement;
-
       if (!document.fullscreenElement) {
-        await element.requestFullscreen();
+        await document.documentElement.requestFullscreen();
       }
 
       interviewStartedRef.current = true;
@@ -352,18 +408,55 @@ export default function LiveInterview() {
         clearTimeout(countdownTimerRef.current);
         countdownTimerRef.current = null;
       }
+
+      if (questionRef.current) {
+        playQuestion(questionRef.current);
+      }
     } catch (err) {
-      console.error("Fullscreen request failed:", err);
+      console.error("Fullscreen error:", err);
 
       setError(
-        "Unable to enter fullscreen mode. Please allow fullscreen access and try again."
+        "Unable to enter fullscreen mode. Please try again."
       );
     }
   };
 
-  // =========================================
-  // HANDLE FULLSCREEN CHANGES
-  // =========================================
+  // --------------------------------------------------
+  // RESTORE FULLSCREEN
+  // --------------------------------------------------
+
+  const restoreFullscreen = async () => {
+    try {
+      if (!document.fullscreenElement) {
+        await document.documentElement.requestFullscreen();
+      }
+
+      if (countdownTimerRef.current) {
+        clearTimeout(countdownTimerRef.current);
+        countdownTimerRef.current = null;
+      }
+
+      pausedRef.current = false;
+
+      setIsPaused(false);
+      setFullscreenWarning(false);
+      setCountdown(8);
+
+      if (questionRef.current) {
+        playQuestion(questionRef.current);
+      }
+    } catch (err) {
+      console.error("Fullscreen restoration failed:", err);
+
+      setProctoringMessage(
+        "Please use the fullscreen button to resume."
+      );
+    }
+  };
+
+  // --------------------------------------------------
+  // FULLSCREEN MONITORING
+  // --------------------------------------------------
 
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -407,46 +500,23 @@ export default function LiveInterview() {
         handleFullscreenChange
       );
     };
-  }, []);
+  }, [stopInterviewActivity, terminateInterview]);
 
-  // =========================================
-  // RESTORE FULLSCREEN
-  // =========================================
-
-  const restoreFullscreen = async () => {
-    try {
-      if (!document.fullscreenElement) {
-        await document.documentElement.requestFullscreen();
-      }
-
-      if (countdownTimerRef.current) {
-        clearTimeout(countdownTimerRef.current);
-        countdownTimerRef.current = null;
-      }
-
-      pausedRef.current = false;
-
-      setIsPaused(false);
-      setFullscreenWarning(false);
-      setCountdown(8);
-    } catch (err) {
-      console.error("Unable to restore fullscreen:", err);
-
-      setSpeechError(
-        "Please use the fullscreen button to resume your interview."
-      );
-    }
-  };
-
-  // =========================================
-  // CAMERA AND MICROPHONE INITIALIZATION
-  // =========================================
+  // --------------------------------------------------
+  // CAMERA AND MICROPHONE
+  // --------------------------------------------------
 
   useEffect(() => {
     let mounted = true;
 
     const initializeMedia = async () => {
       try {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error(
+            "Camera and microphone access is not supported by this browser."
+          );
+        }
+
         const mediaStream =
           await navigator.mediaDevices.getUserMedia({
             video: {
@@ -479,8 +549,8 @@ export default function LiveInterview() {
 
           try {
             await videoRef.current.play();
-          } catch (playError) {
-            console.warn("Camera preview autoplay:", playError);
+          } catch (err) {
+            console.warn("Video autoplay:", err);
           }
         }
 
@@ -490,7 +560,8 @@ export default function LiveInterview() {
 
         if (mounted) {
           setPermissionError(
-            "Camera and microphone access is required. Please allow both permissions in your browser and reload the interview."
+            err.message ||
+              "Camera and microphone access is required. Please allow permissions and reload."
           );
         }
       }
@@ -503,37 +574,23 @@ export default function LiveInterview() {
     };
   }, []);
 
-  // =========================================
+  // --------------------------------------------------
   // CAMERA PREVIEW
-  // =========================================
+  // --------------------------------------------------
 
   useEffect(() => {
-    const video = videoRef.current;
+    if (!videoRef.current || !streamRef.current) return;
 
-    if (!video || !streamRef.current) return;
+    videoRef.current.srcObject = streamRef.current;
 
-    video.srcObject = streamRef.current;
+    videoRef.current.play().catch((err) => {
+      console.warn("Camera preview:", err);
+    });
+  }, [cameraEnabled, loading]);
 
-    const playVideo = () => {
-      video.play().catch((err) => {
-        console.warn("Video preview could not autoplay:", err);
-      });
-    };
-
-    if (video.readyState >= 2) {
-      playVideo();
-    } else {
-      video.onloadedmetadata = playVideo;
-    }
-
-    return () => {
-      video.onloadedmetadata = null;
-    };
-  }, [loading, cameraEnabled]);
-
-  // =========================================
-  // DEEPGRAM SUPPORT CHECK
-  // =========================================
+  // --------------------------------------------------
+  // DEEPGRAM SUPPORT
+  // --------------------------------------------------
 
   useEffect(() => {
     const supported =
@@ -545,14 +602,14 @@ export default function LiveInterview() {
 
     if (!supported) {
       setSpeechError(
-        "Your browser does not support live audio streaming. Please use the latest Chrome or Edge."
+        "Please use the latest Chrome or Edge browser for voice recognition."
       );
     }
   }, []);
 
-  // =========================================
-  // DEEPGRAM TRANSCRIPT HANDLER
-  // =========================================
+  // --------------------------------------------------
+  // DEEPGRAM MESSAGE HANDLER
+  // --------------------------------------------------
 
   const handleDeepgramMessage = (event) => {
     let message;
@@ -563,51 +620,54 @@ export default function LiveInterview() {
       return;
     }
 
-    const transcript =
-      message.channel?.alternatives?.[0]?.transcript?.trim() || "";
-
-    if (!transcript) return;
-
-    if (message.type === "Results") {
-      if (message.is_final) {
-        finalTranscriptPartsRef.current.push(transcript);
-
-        transcriptRef.current =
-          finalTranscriptPartsRef.current.join(" ").trim();
-
-        interimTranscriptRef.current = "";
-
-        setAnswer(transcriptRef.current);
-        speechStartedRef.current = true;
-      } else {
-        interimTranscriptRef.current = transcript;
-
-        const combined = [
-          finalTranscriptPartsRef.current.join(" "),
-          interimTranscriptRef.current,
-        ]
-          .filter(Boolean)
-          .join(" ")
-          .trim();
-
-        setAnswer(combined);
-      }
-    }
-
     if (message.type === "Error") {
       console.error("Deepgram error:", message);
 
       setSpeechError(
         message.description ||
           message.message ||
-          "Deepgram speech recognition encountered an error."
+          "Speech recognition error."
       );
+
+      return;
+    }
+
+    if (message.type !== "Results") return;
+
+    const transcript =
+      message.channel?.alternatives?.[0]?.transcript?.trim() || "";
+
+    if (!transcript) return;
+
+    if (message.is_final) {
+      finalTranscriptPartsRef.current.push(transcript);
+
+      transcriptRef.current =
+        finalTranscriptPartsRef.current.join(" ").trim();
+
+      interimTranscriptRef.current = "";
+
+      setAnswer(transcriptRef.current);
+
+      speechStartedRef.current = true;
+    } else {
+      interimTranscriptRef.current = transcript;
+
+      const combined = [
+        finalTranscriptPartsRef.current.join(" "),
+        interimTranscriptRef.current,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .trim();
+
+      setAnswer(combined);
     }
   };
 
-  // =========================================
+  // --------------------------------------------------
   // START DEEPGRAM STREAMING
-  // =========================================
+  // --------------------------------------------------
 
   const startListening = async () => {
     if (
@@ -616,13 +676,15 @@ export default function LiveInterview() {
       submittingRef.current ||
       completedRef.current ||
       pausedRef.current ||
-      !proctoringReady ||
       terminationRef.current
     ) {
       return false;
     }
 
-    if (listeningWantedRef.current || deepgramConnectingRef.current) {
+    if (
+      listeningWantedRef.current ||
+      deepgramConnectingRef.current
+    ) {
       return false;
     }
 
@@ -636,37 +698,32 @@ export default function LiveInterview() {
     const audioTracks = stream.getAudioTracks();
 
     if (!audioTracks.length || !audioTracks[0].enabled) {
-      setSpeechError(
-        "Microphone is disabled. Please enable microphone access."
-      );
+      setSpeechError("Please enable microphone access.");
       return false;
     }
 
     listeningWantedRef.current = true;
     deepgramConnectingRef.current = true;
 
-    finalizingRef.current = false;
     finalTranscriptPartsRef.current = [];
     interimTranscriptRef.current = "";
-
     transcriptRef.current = "";
+
+    speechStartedRef.current = false;
+    silenceStartedAtRef.current = null;
+    silenceSubmitLockRef.current = false;
+
     setAnswer("");
     setSpeechError("");
     setIsListening(false);
+    setSilenceCountdown(4);
 
     try {
-      // Request a short-lived token from our FastAPI backend.
       const tokenResponse = await getDeepgramToken(sessionId);
 
       if (!listeningWantedRef.current) {
         deepgramConnectingRef.current = false;
         return false;
-      }
-
-      const accessToken = tokenResponse.access_token;
-
-      if (!accessToken) {
-        throw new Error("The backend did not return a Deepgram token.");
       }
 
       const params = new URLSearchParams({
@@ -680,119 +737,191 @@ export default function LiveInterview() {
         vad_events: "true",
       });
 
-      const socketUrl =
-        `wss://api.deepgram.com/v1/listen?${params.toString()}`;
-
-      // Browser WebSocket authentication with a temporary JWT.
       const socket = new WebSocket(
-        socketUrl,
-        ["bearer", accessToken]
+        `wss://api.deepgram.com/v1/listen?${params.toString()}`,
+        ["bearer", tokenResponse.access_token]
       );
 
       deepgramSocketRef.current = socket;
 
-      socket.onopen = () => {
-        deepgramConnectingRef.current = false;
+      await new Promise((resolve, reject) => {
+        const connectionTimeout = setTimeout(() => {
+          reject(new Error("Deepgram connection timed out."));
+        }, 15000);
 
-        if (!listeningWantedRef.current) {
-          socket.close();
-          return;
-        }
+        socket.onopen = () => {
+          clearTimeout(connectionTimeout);
+          resolve();
+        };
 
-        try {
-          const audioOnlyStream = new MediaStream(audioTracks);
+        socket.onerror = () => {
+          clearTimeout(connectionTimeout);
+          reject(new Error("Unable to connect to Deepgram."));
+        };
 
-          let mimeType = "";
+        socket.onclose = (event) => {
+          if (!deepgramReadyRef.current) {
+            clearTimeout(connectionTimeout);
 
-          const supportedTypes = [
-            "audio/webm;codecs=opus",
-            "audio/webm",
-            "audio/mp4",
-          ];
-
-          for (const type of supportedTypes) {
-            if (MediaRecorder.isTypeSupported(type)) {
-              mimeType = type;
-              break;
-            }
+            reject(
+              new Error(
+                `Deepgram connection closed (${event.code}).`
+              )
+            );
           }
+        };
+      });
 
-          const recorder = mimeType
-            ? new MediaRecorder(audioOnlyStream, { mimeType })
-            : new MediaRecorder(audioOnlyStream);
+      if (!listeningWantedRef.current) {
+        socket.close();
+        return false;
+      }
 
-          mediaRecorderRef.current = recorder;
+      const audioOnlyStream = new MediaStream(audioTracks);
 
-          recorder.ondataavailable = (event) => {
-            if (
-              event.data &&
-              event.data.size > 0 &&
-              socket.readyState === WebSocket.OPEN &&
-              !finalizingRef.current
-            ) {
-              socket.send(event.data);
-            }
-          };
+      const supportedTypes = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/mp4",
+      ];
 
-          recorder.onerror = (event) => {
-            console.error("MediaRecorder error:", event);
-            setSpeechError("Microphone audio capture failed.");
-          };
+      let mimeType = "";
 
-          recorder.start(250);
-
-          deepgramReadyRef.current = true;
-          setIsListening(true);
-          setSpeechError("");
-
-          console.log("Deepgram streaming connection established.");
-        } catch (err) {
-          console.error("Unable to start audio recorder:", err);
-
-          setSpeechError(
-            "Unable to capture microphone audio. Please check your browser permissions."
-          );
-
-          stopListening();
+      for (const type of supportedTypes) {
+        if (MediaRecorder.isTypeSupported(type)) {
+          mimeType = type;
+          break;
         }
+      }
+
+      const recorder = mimeType
+        ? new MediaRecorder(audioOnlyStream, { mimeType })
+        : new MediaRecorder(audioOnlyStream);
+
+      mediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (event) => {
+        if (
+          event.data?.size > 0 &&
+          socket.readyState === WebSocket.OPEN
+        ) {
+          socket.send(event.data);
+        }
+      };
+
+      recorder.onerror = (event) => {
+        console.error("MediaRecorder error:", event);
+        setSpeechError("Microphone audio capture failed.");
       };
 
       socket.onmessage = handleDeepgramMessage;
 
-      socket.onerror = (event) => {
-        console.error("Deepgram WebSocket error:", event);
-
-        deepgramConnectingRef.current = false;
-        deepgramReadyRef.current = false;
-
-        setSpeechError(
-          "Speech recognition connection failed. Please try again."
-        );
-
-        setIsListening(false);
-      };
-
       socket.onclose = (event) => {
-        console.log(
-          "Deepgram connection closed:",
-          event.code,
-          event.reason
-        );
-
-        deepgramConnectingRef.current = false;
         deepgramReadyRef.current = false;
+        deepgramConnectingRef.current = false;
 
         if (deepgramSocketRef.current === socket) {
           deepgramSocketRef.current = null;
         }
 
-        if (listeningWantedRef.current && !finalizingRef.current) {
+        if (
+          listeningWantedRef.current &&
+          !completedRef.current
+        ) {
           setIsListening(false);
+
+          console.warn(
+            "Deepgram disconnected:",
+            event.code,
+            event.reason
+          );
+
           setSpeechError(
-            "Speech recognition disconnected. Please try speaking again."
+            "Speech recognition disconnected. Please try again."
           );
         }
       };
+
+      recorder.start(250);
+
+      deepgramReadyRef.current = true;
+      deepgramConnectingRef.current = false;
+
+      setIsListening(true);
+      setSpeechError("");
+
+      // Start voice activity detection.
+      const audioContext = new (
+        window.AudioContext || window.webkitAudioContext
+      )();
+
+      audioContextRef.current = audioContext;
+
+      const source = audioContext.createMediaStreamSource(
+        audioOnlyStream
+      );
+
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 2048;
+
+      source.connect(analyser);
+      analyserRef.current = analyser;
+
+      const samples = new Uint8Array(analyser.fftSize);
+
+      vadIntervalRef.current = setInterval(() => {
+        if (
+          !listeningWantedRef.current ||
+          !deepgramReadyRef.current ||
+          submittingRef.current ||
+          pausedRef.current
+        ) {
+          return;
+        }
+
+        analyser.getByteTimeDomainData(samples);
+
+        let sum = 0;
+
+        for (let i = 0; i < samples.length; i++) {
+          const normalized = (samples[i] - 128) / 128;
+          sum += normalized * normalized;
+        }
+
+        const rms = Math.sqrt(sum / samples.length);
+
+        if (rms > SILENCE_THRESHOLD) {
+          speechStartedRef.current = true;
+          silenceStartedAtRef.current = null;
+          setSilenceCountdown(4);
+        } else if (speechStartedRef.current) {
+          if (!silenceStartedAtRef.current) {
+            silenceStartedAtRef.current = Date.now();
+          }
+
+          const elapsed =
+            Date.now() - silenceStartedAtRef.current;
+
+          const remaining = Math.max(
+            0,
+            Math.ceil(
+              (SILENCE_DURATION_MS - elapsed) / 1000
+            )
+          );
+
+          setSilenceCountdown(remaining);
+
+          if (
+            elapsed >= SILENCE_DURATION_MS &&
+            !silenceSubmitLockRef.current
+          ) {
+            silenceSubmitLockRef.current = true;
+            handleSubmitAnswer();
+          }
+        }
+      }, 200);
+
+      console.log("Deepgram streaming started.");
 
       return true;
     } catch (err) {
@@ -806,28 +935,494 @@ export default function LiveInterview() {
 
       setSpeechError(
         err.message ||
-          "Unable to connect to Deepgram. Please try again."
+          "Unable to connect to the speech recognition service."
       );
+
+      const socket = deepgramSocketRef.current;
+
+      if (socket) {
+        try {
+          socket.close();
+        } catch {}
+      }
+
+      deepgramSocketRef.current = null;
 
       return false;
     }
   };
-    // =========================================
-  // FORMAT INTERVIEW TIMER
-  // =========================================
 
-  const formatTime = (seconds) => {
-    const minutes = Math.floor(seconds / 60);
-    const remainingSeconds = seconds % 60;
+  // --------------------------------------------------
+  // FINALIZE TRANSCRIPT
+  // --------------------------------------------------
 
-    return `${String(minutes).padStart(2, "0")}:${String(
-      remainingSeconds
-    ).padStart(2, "0")}`;
+  const stopListeningAndGetTranscript = async () => {
+    listeningWantedRef.current = false;
+    deepgramReadyRef.current = false;
+
+    if (vadIntervalRef.current) {
+      clearInterval(vadIntervalRef.current);
+      vadIntervalRef.current = null;
+    }
+
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => {});
+      audioContextRef.current = null;
+      analyserRef.current = null;
+    }
+
+    const recorder = mediaRecorderRef.current;
+    const socket = deepgramSocketRef.current;
+
+    mediaRecorderRef.current = null;
+
+    // Allow the final audio chunk to reach Deepgram.
+    if (recorder && recorder.state !== "inactive") {
+      await new Promise((resolve) => {
+        recorder.onstop = resolve;
+
+        try {
+          recorder.stop();
+        } catch {
+          resolve();
+        }
+      });
+    }
+
+    // Give Deepgram time to process the last audio packets.
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+
+    if (socket) {
+      try {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.close(1000, "Finished speaking");
+        }
+      } catch {}
+    }
+
+    deepgramSocketRef.current = null;
+
+    setIsListening(false);
+
+    const finalText = [
+      finalTranscriptPartsRef.current.join(" "),
+      interimTranscriptRef.current,
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+
+    transcriptRef.current = finalText;
+
+    return finalText;
   };
 
-  // =========================================
-  // TERMINATED INTERVIEW
-  // =========================================
+  // --------------------------------------------------
+  // PLAY AI QUESTION
+  // --------------------------------------------------
+
+  const playQuestion = async (text) => {
+    if (
+      !text ||
+      completedRef.current ||
+      pausedRef.current ||
+      terminationRef.current
+    ) {
+      return;
+    }
+
+    stopListening();
+
+    setVoiceStatus("generating");
+    setSpeechError("");
+
+    try {
+      const audioBlob = await speakQuestion(text);
+
+      if (completedRef.current || pausedRef.current) return;
+
+      if (audioUrlRef.current) {
+        URL.revokeObjectURL(audioUrlRef.current);
+      }
+
+      const audioUrl = URL.createObjectURL(audioBlob);
+      audioUrlRef.current = audioUrl;
+
+      const audio = new Audio(audioUrl);
+      audioRef.current = audio;
+
+      setVoiceStatus("speaking");
+
+      audio.onended = () => {
+        if (
+          completedRef.current ||
+          pausedRef.current ||
+          terminationRef.current
+        ) {
+          return;
+        }
+
+        setVoiceStatus("ready");
+
+        startListening();
+      };
+
+      audio.onerror = () => {
+        console.error("Question audio playback failed.");
+
+        setVoiceStatus("error");
+        setSpeechError(
+          "Unable to play the question audio. Please check your audio settings."
+        );
+      };
+
+      await audio.play();
+    } catch (err) {
+      console.error("Question voice generation failed:", err);
+
+      setVoiceStatus("error");
+
+      setSpeechError(
+        err.message ||
+          "Unable to generate interviewer voice."
+      );
+    }
+  };
+
+  // --------------------------------------------------
+  // SUBMIT ANSWER
+  // --------------------------------------------------
+
+  const handleSubmitAnswer = async () => {
+    if (
+      submittingRef.current ||
+      completedRef.current ||
+      pausedRef.current
+    ) {
+      return;
+    }
+
+    submittingRef.current = true;
+    setSubmitting(true);
+
+    setVoiceStatus("generating");
+
+    try {
+      const transcript =
+        await stopListeningAndGetTranscript();
+
+      if (!transcript || transcript.trim().length < 2) {
+        setSpeechError(
+          "No clear answer was detected. Please try answering again."
+        );
+
+        submittingRef.current = false;
+        setSubmitting(false);
+        silenceSubmitLockRef.current = false;
+
+        if (!pausedRef.current && !completedRef.current) {
+          setTimeout(() => {
+            if (questionRef.current) {
+              playQuestion(questionRef.current);
+            }
+          }, 1000);
+        }
+
+        return;
+      }
+
+      setAnswer(transcript);
+
+      console.log("Submitting candidate answer:", transcript);
+
+      const response = await submitAnswer(
+        sessionId,
+        transcript
+      );
+
+      console.log("Answer submission response:", response);
+
+      if (response.status === "completed" || response.completed) {
+        completedRef.current = true;
+
+        setCompleted(true);
+        setSubmitting(false);
+        submittingRef.current = false;
+
+        stopInterviewActivity();
+
+        if (streamRef.current) {
+          streamRef.current
+            .getTracks()
+            .forEach((track) => track.stop());
+
+          streamRef.current = null;
+        }
+
+        setCameraEnabled(false);
+        setMicEnabled(false);
+
+        return;
+      }
+
+      const nextQuestion = extractQuestion(response);
+
+      if (nextQuestion) {
+        displayQuestion(nextQuestion);
+        setSubmitting(false);
+        submittingRef.current = false;
+
+        setTimeout(() => {
+          if (!pausedRef.current && !completedRef.current) {
+            playQuestion(nextQuestion.question);
+          }
+        }, 500);
+
+        return;
+      }
+
+      // If the answer endpoint does not return the next question,
+      // retrieve the updated session state from the backend.
+      const updatedSession = await getInterview(sessionId);
+
+      if (updatedSession.status === "completed") {
+        completedRef.current = true;
+        setCompleted(true);
+
+        stopInterviewActivity();
+
+        return;
+      }
+
+      const updatedQuestion = extractQuestion(updatedSession);
+
+      if (updatedQuestion) {
+        displayQuestion(updatedQuestion);
+
+        setTimeout(() => {
+          if (!pausedRef.current && !completedRef.current) {
+            playQuestion(updatedQuestion.question);
+          }
+        }, 500);
+      } else {
+        throw new Error(
+          "The answer was submitted, but the next question was not returned."
+        );
+      }
+    } catch (err) {
+      console.error("Answer submission failed:", err);
+
+      setSpeechError(
+        err.response?.data?.detail ||
+          err.message ||
+          "Unable to submit your answer."
+      );
+
+      silenceSubmitLockRef.current = false;
+    } finally {
+      submittingRef.current = false;
+
+      if (mountedRef.current) {
+        setSubmitting(false);
+      }
+    }
+  };
+
+  // --------------------------------------------------
+  // INITIALIZE / LOAD INTERVIEW
+  // --------------------------------------------------
+
+  useEffect(() => {
+    let mounted = true;
+
+    mountedRef.current = true;
+
+    const initializeInterview = async () => {
+      if (!sessionId) {
+        setError(
+          "Interview session ID is missing. Please restart your interview."
+        );
+
+        setLoading(false);
+        return;
+      }
+
+      if (initializationRef.current) return;
+
+      initializationRef.current = true;
+
+      try {
+        setLoading(true);
+        setError("");
+
+        console.log("Loading interview session:", sessionId);
+
+        // First, check the existing session.
+        let session = await getInterview(sessionId);
+
+        console.log("Existing interview session:", session);
+
+        if (!mounted) return;
+
+        if (
+          session.status === "completed" ||
+          session.status === "terminated"
+        ) {
+          if (session.status === "completed") {
+            setCompleted(true);
+          } else {
+            setTerminated(true);
+            setProctoringMessage(
+              session.termination_reason ||
+                "This interview has been terminated."
+            );
+          }
+
+          return;
+        }
+
+        if (session.preparation_status === "processing") {
+          throw new Error(
+            "Your interview is still being prepared. Please refresh after preparation is complete."
+          );
+        }
+
+        if (session.preparation_status === "failed") {
+          throw new Error(
+            session.preparation_error ||
+              "Interview preparation failed. Please contact the recruiter."
+          );
+        }
+
+        let currentQuestion = extractQuestion(session);
+
+        // Start only when the session has not started.
+        if (
+          session.status === "not_started" ||
+          session.status === "pending"
+        ) {
+          console.log("Starting the interview...");
+
+          const startResponse = await startInterview(sessionId);
+
+          console.log("Start interview response:", startResponse);
+
+          if (!mounted) return;
+
+          if (
+            startResponse.status === "completed" ||
+            startResponse.completed
+          ) {
+            setCompleted(true);
+            return;
+          }
+
+          currentQuestion = extractQuestion(startResponse);
+        }
+
+        // Some backends return the question in the session metadata
+        // but not in current_question. Refresh once if needed.
+        if (!currentQuestion) {
+          session = await getInterview(sessionId);
+
+          if (!mounted) return;
+
+          currentQuestion = extractQuestion(session);
+        }
+
+        if (!currentQuestion) {
+          throw new Error(
+            "The interview session is ready, but no current question was found. Please check the backend start-interview response."
+          );
+        }
+
+        displayQuestion(currentQuestion);
+
+        console.log(
+          "Interview initialized with question:",
+          currentQuestion.question
+        );
+      } catch (err) {
+        console.error("Interview initialization error:", err);
+
+        if (mounted) {
+          setError(
+            err.response?.data?.detail ||
+              err.message ||
+              "Unable to prepare your interview."
+          );
+        }
+      } finally {
+        if (mounted) {
+          setLoading(false);
+        }
+      }
+    };
+
+    initializeInterview();
+
+    return () => {
+  mounted = false;
+  mountedRef.current = false;
+
+  // Reset initialization guard for React Strict Mode
+  initializationRef.current = false;
+};
+  }, [sessionId]);
+
+  // --------------------------------------------------
+  // INTERVIEW TIMER
+  // --------------------------------------------------
+
+  useEffect(() => {
+    if (!proctoringReady || completed || terminated || isPaused) {
+      return;
+    }
+
+    const timer = setInterval(() => {
+      setSecondsElapsed((previous) => previous + 1);
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [proctoringReady, completed, terminated, isPaused]);
+
+  // --------------------------------------------------
+  // CLEANUP
+  // --------------------------------------------------
+
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false;
+
+      stopListening();
+
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current = null;
+      }
+
+      if (audioUrlRef.current) {
+        URL.revokeObjectURL(audioUrlRef.current);
+        audioUrlRef.current = null;
+      }
+
+      if (streamRef.current) {
+        streamRef.current
+          .getTracks()
+          .forEach((track) => track.stop());
+
+        streamRef.current = null;
+      }
+
+      if (countdownTimerRef.current) {
+        clearTimeout(countdownTimerRef.current);
+      }
+    };
+  }, [stopListening]);
+
+  // --------------------------------------------------
+  // TERMINATED SCREEN
+  // --------------------------------------------------
 
   if (terminated) {
     return (
@@ -858,9 +1453,9 @@ export default function LiveInterview() {
     );
   }
 
-  // =========================================
-  // COMPLETED INTERVIEW
-  // =========================================
+  // --------------------------------------------------
+  // COMPLETED SCREEN
+  // --------------------------------------------------
 
   if (completed) {
     return (
@@ -888,9 +1483,9 @@ export default function LiveInterview() {
     );
   }
 
-  // =========================================
-  // LOADING
-  // =========================================
+  // --------------------------------------------------
+  // LOADING SCREEN
+  // --------------------------------------------------
 
   if (loading) {
     return (
@@ -904,17 +1499,19 @@ export default function LiveInterview() {
     );
   }
 
-  // =========================================
+  // --------------------------------------------------
   // MAIN INTERVIEW UI
-  // =========================================
+  // --------------------------------------------------
 
   return (
     <div className="min-h-screen bg-[#07091b] text-white">
 
       {/* FULLSCREEN START GATE */}
+
       {!proctoringReady && (
         <div className="fixed inset-0 z-[100] bg-[#07091b]/95 backdrop-blur-sm flex items-center justify-center p-6">
           <div className="max-w-lg w-full bg-[#11182c] border border-white/10 rounded-2xl p-8 text-center shadow-2xl">
+
             <div className="w-16 h-16 rounded-2xl bg-purple-500/15 text-purple-300 flex items-center justify-center mx-auto mb-5">
               <AlertCircle size={34} />
             </div>
@@ -924,18 +1521,20 @@ export default function LiveInterview() {
             </h2>
 
             <p className="text-slate-300 mb-4">
-              Your interview will start in fullscreen mode. Leaving
-              fullscreen will pause the interview and trigger a warning.
+              Your interview will start in fullscreen mode.
+              Leaving fullscreen will pause the interview and
+              trigger a warning.
             </p>
 
             <p className="text-slate-400 text-sm mb-6">
-              You have two warnings. If you do not return within 8 seconds,
-              or exit fullscreen for a third time, the interview will be terminated.
+              You have two warnings. If you do not return within
+              8 seconds, or exit fullscreen for a third time,
+              the interview will be terminated.
             </p>
 
-            {proctoringMessage && (
-              <p className="text-yellow-300 text-sm mb-4">
-                {proctoringMessage}
+            {error && (
+              <p className="text-red-300 text-sm mb-4">
+                {error}
               </p>
             )}
 
@@ -945,14 +1544,24 @@ export default function LiveInterview() {
               </p>
             )}
 
+            <div className="text-sm text-slate-400 mb-5 space-y-2">
+              <p>
+                Camera: {cameraEnabled ? "Ready" : "Not available"}
+              </p>
+
+              <p>
+                Microphone: {micEnabled ? "Ready" : "Not available"}
+              </p>
+            </div>
+
             <button
               onClick={enterFullscreen}
               disabled={
-                loading ||
                 Boolean(error) ||
                 Boolean(permissionError) ||
                 !cameraEnabled ||
-                !micEnabled
+                !micEnabled ||
+                !question
               }
               className="w-full bg-purple-600 hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed px-6 py-3 rounded-xl font-semibold"
             >
@@ -963,9 +1572,11 @@ export default function LiveInterview() {
       )}
 
       {/* FULLSCREEN EXIT WARNING */}
+
       {fullscreenWarning && isPaused && (
         <div className="fixed inset-0 z-[110] bg-black/90 backdrop-blur-md flex items-center justify-center p-6">
           <div className="max-w-md w-full bg-[#11182c] border border-yellow-500/40 rounded-2xl p-8 text-center shadow-2xl">
+
             <AlertCircle className="w-14 h-14 text-yellow-400 mx-auto mb-4" />
 
             <p className="text-yellow-300 text-sm font-semibold mb-2">
@@ -977,7 +1588,8 @@ export default function LiveInterview() {
             </h2>
 
             <p className="text-slate-300 mb-5">
-              Your interview is paused. Return to fullscreen immediately to continue.
+              Your interview is paused. Return to fullscreen
+              immediately to continue.
             </p>
 
             <div className="text-5xl font-bold font-mono text-yellow-300 mb-5">
@@ -992,13 +1604,15 @@ export default function LiveInterview() {
             </button>
 
             <p className="text-slate-500 text-xs mt-4">
-              If the countdown reaches zero, your interview will be terminated.
+              If the countdown reaches zero, your interview
+              will be terminated.
             </p>
           </div>
         </div>
       )}
 
       {/* HEADER */}
+
       <header className="border-b border-white/10 px-6 py-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <div className="bg-purple-600 p-2 rounded-xl">
@@ -1017,14 +1631,17 @@ export default function LiveInterview() {
       </header>
 
       {/* MAIN CONTENT */}
+
       <main className="max-w-7xl mx-auto p-6">
+
         {isPaused && (
           <div className="mb-5 rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-4 text-yellow-200">
             Interview paused — return to fullscreen to continue.
           </div>
         )}
 
-        {/* CANDIDATE DETAILS AND TIMER */}
+        {/* CANDIDATE AND TIMER */}
+
         <div className="flex flex-wrap items-center justify-between gap-4 mb-7">
           <div>
             <p className="text-slate-400 text-sm">
@@ -1045,7 +1662,8 @@ export default function LiveInterview() {
           </div>
         </div>
 
-        {/* GENERAL ERROR */}
+        {/* ERRORS */}
+
         {error && (
           <div className="mb-5 p-4 rounded-xl bg-red-500/10 border border-red-500/30 text-red-300 flex gap-2">
             <AlertCircle size={20} />
@@ -1053,7 +1671,6 @@ export default function LiveInterview() {
           </div>
         )}
 
-        {/* CAMERA PERMISSION ERROR */}
         {permissionError && (
           <div className="mb-5 p-4 rounded-xl bg-yellow-500/10 border border-yellow-500/30 text-yellow-200">
             {permissionError}
@@ -1061,17 +1678,19 @@ export default function LiveInterview() {
         )}
 
         {/* MAIN GRID */}
+
         <div className="grid lg:grid-cols-2 gap-6">
 
-          {/* CAMERA SECTION */}
+          {/* CAMERA */}
+
           <section className="bg-[#11182c] border border-white/10 rounded-2xl p-5">
+
             <div className="flex justify-between items-center mb-4">
               <h3 className="font-semibold">
                 Candidate Camera
               </h3>
             </div>
 
-            {/* VIDEO PREVIEW */}
             <div className="bg-black rounded-xl overflow-hidden aspect-video flex items-center justify-center">
               <video
                 ref={videoRef}
@@ -1091,7 +1710,8 @@ export default function LiveInterview() {
               )}
             </div>
 
-            <div className="flex justify-center gap-3 mt-5">
+            <div className="flex justify-center gap-3 mt-5 flex-wrap">
+
               <div className="flex items-center gap-2 rounded-lg bg-green-500/10 border border-green-500/20 px-4 py-2 text-sm text-green-300">
                 <Camera size={17} />
                 Camera required
@@ -1101,18 +1721,21 @@ export default function LiveInterview() {
                 <Mic size={17} />
                 Microphone locked
               </div>
+
             </div>
 
             <p className="text-xs text-center text-slate-500 mt-4">
-              Camera and microphone controls are locked during the interview.
-              Camera preview is active; video is not recorded or stored.
+              Camera and microphone controls are locked during
+              the interview. Camera preview is active; video is
+              not recorded or stored by this component.
             </p>
+
           </section>
 
-          {/* QUESTION AND ANSWER SECTION */}
+          {/* QUESTION AND ANSWER */}
+
           <section className="bg-[#11182c] border border-white/10 rounded-2xl p-6">
 
-            {/* QUESTION HEADER */}
             <div className="flex items-center justify-between mb-5">
               <span className="text-purple-400 text-sm font-semibold">
                 INTERVIEW QUESTION
@@ -1123,8 +1746,8 @@ export default function LiveInterview() {
               </span>
             </div>
 
-            {/* QUESTION DISPLAY */}
             <div className="bg-[#211b46] border border-purple-500/20 rounded-xl p-6 mb-6">
+
               <p className="text-xs text-purple-300 mb-3">
                 {stage}
               </p>
@@ -1132,11 +1755,15 @@ export default function LiveInterview() {
               <h2 className="text-xl md:text-2xl font-semibold leading-relaxed">
                 {question || "Waiting for the next question..."}
               </h2>
+
             </div>
 
-            {/* VOICE-ONLY ANSWER STATUS */}
+            {/* VOICE RESPONSE */}
+
             <div className="rounded-xl border border-white/10 bg-[#07091b] p-6">
+
               <div className="flex items-center justify-between mb-4">
+
                 <span className="text-sm font-semibold">
                   VOICE RESPONSE
                 </span>
@@ -1155,9 +1782,11 @@ export default function LiveInterview() {
                     Waiting
                   </span>
                 )}
+
               </div>
 
               <div className="flex flex-col items-center text-center py-5">
+
                 <div
                   className={`w-20 h-20 rounded-full flex items-center justify-center mb-4 ${
                     isListening
@@ -1186,14 +1815,17 @@ export default function LiveInterview() {
 
                 <p className="text-sm text-slate-400">
                   {isPaused
-                    ? "Return to fullscreen to continue the interview."
+                    ? "Return to fullscreen to continue."
                     : isListening
                     ? speechStartedRef.current
                       ? `Silence detected. Auto-submit in ${silenceCountdown} seconds.`
                       : "Start speaking when you are ready. The silence timer starts after your voice is detected."
                     : "Your answer is captured automatically. No typing or manual submission is required."}
                 </p>
+
               </div>
+
+            
 
               {speechError && (
                 <div className="mt-3 p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/20 text-yellow-300 text-sm flex gap-2">
@@ -1201,15 +1833,18 @@ export default function LiveInterview() {
                   {speechError}
                 </div>
               )}
+
             </div>
           </section>
         </div>
 
         {/* FOOTER */}
+
         <div className="mt-6 text-center text-xs text-slate-500">
           Your recognized answers are submitted to the AI Interview Engine.
           Audio recordings are not stored by this application.
         </div>
+
       </main>
     </div>
   );
