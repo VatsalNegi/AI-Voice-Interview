@@ -1,4 +1,3 @@
-
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 
@@ -83,6 +82,10 @@ export default function LiveInterview() {
   const silenceSubmitLockRef = useRef(false);
 
   const questionRef = useRef("");
+
+  // Stores the next question while fullscreen is paused.
+  const pendingQuestionRef = useRef(null);
+
   const mountedRef = useRef(true);
 
   // --------------------------------------------------
@@ -442,7 +445,26 @@ export default function LiveInterview() {
       setFullscreenWarning(false);
       setCountdown(8);
 
-      if (questionRef.current) {
+      // Process a question received while fullscreen was paused.
+      if (pendingQuestionRef.current) {
+        const pendingQuestion = pendingQuestionRef.current;
+
+        // Clear it before displaying to prevent duplicate processing.
+        pendingQuestionRef.current = null;
+
+        displayQuestion(pendingQuestion);
+
+        setTimeout(() => {
+          if (!pausedRef.current && !completedRef.current) {
+            playQuestion(pendingQuestion.question);
+          }
+        }, 500);
+
+        return;
+      }
+
+      // Don't replay the previous question while answer submission is pending.
+      if (!submittingRef.current && questionRef.current) {
         playQuestion(questionRef.current);
       }
     } catch (err) {
@@ -1168,15 +1190,21 @@ export default function LiveInterview() {
       const nextQuestion = extractQuestion(response);
 
       if (nextQuestion) {
-        displayQuestion(nextQuestion);
+        if (pausedRef.current) {
+          // Hold the next question until fullscreen is restored.
+          pendingQuestionRef.current = nextQuestion;
+        } else {
+          displayQuestion(nextQuestion);
+
+          setTimeout(() => {
+            if (!pausedRef.current && !completedRef.current) {
+              playQuestion(nextQuestion.question);
+            }
+          }, 500);
+        }
+
         setSubmitting(false);
         submittingRef.current = false;
-
-        setTimeout(() => {
-          if (!pausedRef.current && !completedRef.current) {
-            playQuestion(nextQuestion.question);
-          }
-        }, 500);
 
         return;
       }
@@ -1197,13 +1225,17 @@ export default function LiveInterview() {
       const updatedQuestion = extractQuestion(updatedSession);
 
       if (updatedQuestion) {
-        displayQuestion(updatedQuestion);
+        if (pausedRef.current) {
+          pendingQuestionRef.current = updatedQuestion;
+        } else {
+          displayQuestion(updatedQuestion);
 
-        setTimeout(() => {
-          if (!pausedRef.current && !completedRef.current) {
-            playQuestion(updatedQuestion.question);
-          }
-        }, 500);
+          setTimeout(() => {
+            if (!pausedRef.current && !completedRef.current) {
+              playQuestion(updatedQuestion.question);
+            }
+          }, 500);
+        }
       } else {
         throw new Error(
           "The answer was submitted, but the next question was not returned."
@@ -1362,12 +1394,12 @@ export default function LiveInterview() {
     initializeInterview();
 
     return () => {
-  mounted = false;
-  mountedRef.current = false;
+      mounted = false;
+      mountedRef.current = false;
 
-  // Reset initialization guard for React Strict Mode
-  initializationRef.current = false;
-};
+      // Reset initialization guard for React Strict Mode.
+      initializationRef.current = false;
+    };
   }, [sessionId]);
 
   // --------------------------------------------------
@@ -1824,8 +1856,6 @@ export default function LiveInterview() {
                 </p>
 
               </div>
-
-            
 
               {speechError && (
                 <div className="mt-3 p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/20 text-yellow-300 text-sm flex gap-2">
