@@ -1,8 +1,19 @@
+
 from app.routers.recruiter_dashboard import router as recruiter_dashboard_router
+
 from contextlib import asynccontextmanager
 import os
+import logging
 
-from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks
+import httpx
+
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Depends,
+    status,
+    BackgroundTasks,
+)
 from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -12,13 +23,16 @@ from sqlalchemy.orm import Session
 
 from app.db.session import engine, get_db
 from app.db.models import Recruiter
+
 from app.services.interview_preparation_service import (
     InterviewPreparationService,
 )
+
 from app.auth.security import (
     verify_password,
     create_access_token,
 )
+
 from app.auth.dependencies import get_current_recruiter
 
 from app.schemas.auth import (
@@ -28,6 +42,7 @@ from app.schemas.auth import (
 )
 
 from app.schemas.voice import SpeechRequest
+
 from app.schemas.interview import (
     InterviewSessionCreate,
     InterviewSessionResponse,
@@ -38,6 +53,16 @@ from app.services.tts_service import TTSService
 from app.services.session_manager import SessionManager
 
 
+# --------------------------------------------------
+# LOGGING
+# --------------------------------------------------
+
+logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------
+# INTERVIEW TERMINATION REQUEST
+# --------------------------------------------------
 
 class InterviewTerminationRequest(BaseModel):
     reason: str
@@ -45,16 +70,19 @@ class InterviewTerminationRequest(BaseModel):
     proctoring_event: dict | None = None
 
 
-# --------------------------------------------------
+# ==================================================
 # APPLICATION LIFESPAN
-# --------------------------------------------------
+# ==================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
+
         print("Database connection successful.")
+
     except Exception as exc:
         print(f"Database connection check warning: {exc}")
 
@@ -67,15 +95,14 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
 app.include_router(recruiter_dashboard_router)
 
 
-# --------------------------------------------------
+# ==================================================
 # CORS
-# --------------------------------------------------
+# ==================================================
 
-# Keep local development origins and add deployed frontend origin(s)
-# through FRONTEND_URL. Multiple origins can be comma-separated.
 frontend_origins = [
     origin.strip().rstrip("/")
     for origin in os.getenv("FRONTEND_URL", "").split(",")
@@ -97,29 +124,32 @@ app.add_middleware(
 )
 
 
-# --------------------------------------------------
+# ==================================================
 # HOME
-# --------------------------------------------------
+# ==================================================
 
 @app.get("/")
 def home():
+
     return {
         "message": "AI Voice Interview Engine is running!",
         "status": "success",
     }
 
 
-# --------------------------------------------------
+# ==================================================
 # HEALTH CHECK
-# --------------------------------------------------
+# ==================================================
 
 @app.get("/health")
 def health_check():
+
     db_status = "connected"
 
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
+
     except Exception:
         db_status = "disconnected"
 
@@ -147,6 +177,7 @@ def recruiter_login(
     login_data: RecruiterLogin,
     db: Session = Depends(get_db),
 ):
+
     email = login_data.email.strip().lower()
 
     recruiter = (
@@ -195,12 +226,12 @@ def recruiter_login(
 def get_logged_in_recruiter(
     recruiter: Recruiter = Depends(get_current_recruiter),
 ):
+
     return recruiter
 
 
 # ==================================================
 # CANDIDATE INTERVIEW APIs
-# These remain publicly accessible.
 # ==================================================
 
 
@@ -216,10 +247,9 @@ def create_interview(
     session_data: InterviewSessionCreate,
     background_tasks: BackgroundTasks,
 ):
+
     session = SessionManager.create_session(session_data)
 
-    # Prepare the fixed question set without making the candidate wait
-    # for OpenRouter inside this HTTP request.
     background_tasks.add_task(
         InterviewPreparationService.run,
         session["session_id"],
@@ -240,6 +270,7 @@ def create_interview(
 
 @app.get("/interviews/{session_id}")
 def get_interview(session_id: str):
+
     session = SessionManager.get_session(session_id)
 
     if session is None:
@@ -255,14 +286,11 @@ def get_interview(session_id: str):
 # START INTERVIEW
 # --------------------------------------------------
 
-import logging
-
-logger = logging.getLogger(__name__)
-
-
 @app.post("/interviews/{session_id}/start")
 def start_interview(session_id: str):
+
     try:
+
         session = SessionManager.start_session(session_id)
 
         if session is None:
@@ -280,26 +308,157 @@ def start_interview(session_id: str):
         }
 
     except ValueError as error:
+
         raise HTTPException(
             status_code=409,
             detail=str(error),
         )
 
+    except HTTPException:
+        raise
+
     except Exception:
+
         logger.exception(
             "Unexpected error while starting interview: %s",
             session_id,
         )
+
         raise HTTPException(
             status_code=500,
             detail="Internal error while starting interview. Check backend logs.",
         )
 
-  
 
-# --------------------------------------------------
+# ==================================================
+# DEEPGRAM SPEECH-TO-TEXT AUTHENTICATION
+# ==================================================
+
+@app.post("/voice/deepgram-token")
+async def create_deepgram_token(session_id: str):
+
+    """
+    Generate a short-lived Deepgram JWT token.
+
+    Permanent Deepgram API key remains on the backend.
+    React receives only a temporary token.
+    """
+
+    # 1. Read permanent API key from backend environment
+
+    api_key = os.getenv("DEEPGRAM_API_KEY")
+
+    if not api_key:
+
+        logger.error("DEEPGRAM_API_KEY is missing.")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Deepgram API key is not configured.",
+        )
+
+    # 2. Validate interview session
+
+    session = SessionManager.get_session(session_id)
+
+    if session is None:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Interview session not found.",
+        )
+
+    # 3. Only active interviews can request a token
+
+    if session.get("status") != "in_progress":
+
+        raise HTTPException(
+            status_code=409,
+            detail="Interview session is not active.",
+        )
+
+    # 4. Generate temporary token using Deepgram API
+
+    try:
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+
+            response = await client.post(
+                "https://api.deepgram.com/v1/auth/grant",
+
+                headers={
+                    "Authorization": f"Token {api_key}",
+                    "Content-Type": "application/json",
+                },
+
+                json={
+                    "ttl_seconds": 60
+                },
+            )
+
+            response.raise_for_status()
+
+            token_data = response.json()
+
+        access_token = token_data.get("access_token")
+
+        if not access_token:
+
+            raise HTTPException(
+                status_code=502,
+                detail="Deepgram did not return an access token.",
+            )
+
+        logger.info(
+            "Deepgram temporary token generated for session: %s",
+            session_id,
+        )
+
+        return {
+            "access_token": access_token,
+            "expires_in": token_data.get("expires_in", 60),
+        }
+
+    except httpx.HTTPStatusError:
+
+        logger.exception(
+            "Deepgram authentication request failed."
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail="Deepgram authentication failed. Check API key permissions.",
+        )
+
+    except httpx.RequestError:
+
+        logger.exception(
+            "Unable to connect to Deepgram."
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to connect to Deepgram.",
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception:
+
+        logger.exception(
+            "Unexpected Deepgram token generation error."
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to generate Deepgram token.",
+        )
+
+
+# ==================================================
 # SUBMIT CANDIDATE ANSWER
-# --------------------------------------------------
+# ==================================================
 
 @app.post("/interviews/{session_id}/answer")
 async def submit_candidate_answer(
@@ -307,29 +466,35 @@ async def submit_candidate_answer(
     answer_data: CandidateAnswerSubmit,
     background_tasks: BackgroundTasks,
 ):
+
     session = SessionManager.get_session(session_id)
 
     if session is None:
+
         raise HTTPException(
             status_code=404,
             detail="Interview session not found",
         )
 
     try:
+
         result = await SessionManager.submit_answer(
             session_id=session_id,
             answer_text=answer_data.answer_text,
         )
 
-        # The live interview has finished. Run the AI evaluation after
-        # the response is prepared, so the candidate does not wait for it.
+        # Run post-interview evaluation asynchronously
+
         if result.get("status") == "completed":
-            from app.services.post_interview_evaluator import PostInterviewEvaluator
+
+            from app.services.post_interview_evaluator import (
+                PostInterviewEvaluator
+            )
 
             background_tasks.add_task(
-        PostInterviewEvaluator.run,
-        session_id,
-    )
+                PostInterviewEvaluator.run,
+                session_id,
+            )
 
         return {
             "message": "Answer submitted successfully",
@@ -337,44 +502,50 @@ async def submit_candidate_answer(
         }
 
     except ValueError as error:
+
         raise HTTPException(
             status_code=400,
             detail=str(error),
         )
 
 
-# --------------------------------------------------
+# ==================================================
 # TERMINATE INTERVIEW
-# Terminated interviews retain answers/transcript but skip AI evaluation.
-# --------------------------------------------------
+# ==================================================
 
 @app.post("/interviews/{session_id}/terminate")
 def terminate_interview(
     session_id: str,
     termination_data: InterviewTerminationRequest,
 ):
+
     session = SessionManager.get_session(session_id)
 
     if session is None:
+
         raise HTTPException(
             status_code=404,
             detail="Interview session not found",
         )
 
     try:
+
         terminated_session = SessionManager.terminate_interview(
             session_id=session_id,
             reason=termination_data.reason,
             violation_count=termination_data.violation_count,
             proctoring_event=termination_data.proctoring_event,
         )
+
     except ValueError as error:
+
         raise HTTPException(
             status_code=409,
             detail=str(error),
         )
 
     if terminated_session is None:
+
         raise HTTPException(
             status_code=404,
             detail="Interview session not found",
@@ -394,28 +565,31 @@ def terminate_interview(
     }
 
 
-# --------------------------------------------------
+# ==================================================
 # INTERVIEW REPORT
-# Evaluation is performed asynchronously after completion.
-# --------------------------------------------------
+# ==================================================
 
 @app.get("/interviews/{session_id}/report")
 def get_interview_report(session_id: str):
+
     session = SessionManager.get_session(session_id)
 
     if session is None:
+
         raise HTTPException(
             status_code=404,
             detail="Interview session not found",
         )
 
     if session["status"] == "terminated":
+
         raise HTTPException(
             status_code=409,
             detail="This interview was terminated. Its answers and transcript are retained, but no hiring evaluation or recommendation is generated.",
         )
 
     if session["status"] != "completed":
+
         raise HTTPException(
             status_code=409,
             detail="Interview must be completed before the report is available.",
@@ -425,13 +599,19 @@ def get_interview_report(session_id: str):
     final_report = session.get("final_report")
 
     if evaluation_status == "completed" and final_report:
+
         return {
             "message": "Interview report generated successfully",
             "evaluation_status": "completed",
             "report": final_report,
         }
 
-    if evaluation_status in {"pending", "processing", "not_started"}:
+    if evaluation_status in {
+        "pending",
+        "processing",
+        "not_started",
+    }:
+
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
             content={
@@ -442,6 +622,7 @@ def get_interview_report(session_id: str):
         )
 
     if evaluation_status == "failed":
+
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={
@@ -474,6 +655,7 @@ def get_interview_report(session_id: str):
 def list_interviews(
     recruiter: Recruiter = Depends(get_current_recruiter),
 ):
+
     interviews = SessionManager.get_all_interviews()
 
     return {
@@ -491,9 +673,11 @@ def delete_interview(
     session_id: str,
     recruiter: Recruiter = Depends(get_current_recruiter),
 ):
+
     deleted = SessionManager.delete_interview(session_id)
 
     if not deleted:
+
         raise HTTPException(
             status_code=404,
             detail="Interview session not found",
@@ -513,7 +697,9 @@ def delete_interview(
 async def generate_interviewer_voice(
     speech_data: SpeechRequest,
 ):
+
     try:
+
         audio_bytes, generation_id = (
             await TTSService.generate_speech(speech_data.text)
         )
@@ -530,6 +716,7 @@ async def generate_interviewer_voice(
         )
 
     except RuntimeError as error:
+
         raise HTTPException(
             status_code=502,
             detail=str(error),

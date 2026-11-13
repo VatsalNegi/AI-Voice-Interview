@@ -176,4 +176,41 @@ export const speakQuestion = async (text) => {
   }
 };
 
+// -----------------------------------------
+// DEEPGRAM TEMPORARY ACCESS TOKEN
+// -----------------------------------------
+
+export const getDeepgramToken = async (sessionId) => {
+  try {
+    if (!sessionId) {
+      throw new Error("Interview session ID is required.");
+    }
+
+    const response = await api.post(
+      "/voice/deepgram-token",
+      null,
+      {
+        params: {
+          session_id: sessionId,
+        },
+      }
+    );
+
+    if (!response.data?.access_token) {
+      throw new Error("Deepgram did not return an access token.");
+    }
+
+    return response.data;
+  } catch (error) {
+    const message =
+      error.response?.data?.detail ||
+      error.message ||
+      "Unable to connect to the speech recognition service.";
+
+    console.error("Deepgram token error:", message);
+
+    throw new Error(message);
+  }
+};
+
 export default api;
